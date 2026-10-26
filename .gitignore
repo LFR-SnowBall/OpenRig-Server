@@ -1,0 +1,13 @@
+# User workspaces and backups are local to the server host
+workspaces/*
+!workspaces/.gitkeep
+backups/*
+!backups/.gitkeep
+config/users.db
+config/invites.json
+.users.db
+.invites.json
+__pycache__/
+
+.DS_Store
+*.log

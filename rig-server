@@ -1,0 +1,394 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# 🏢 OpenRig-Server CLI — Enterprise Multi-Tenant Dev & Sec Workstation Hub
+# Vendor: Linux Open Source S.A. de C.V. / LFR-SnowBall
+# ==============================================================================
+set -euo pipefail
+
+SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SOURCE" ]; do
+    DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+    SOURCE="$(readlink "$SOURCE")"
+    [[ $SOURCE != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+SERVER_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+
+export PATH="${HOME}/.orbstack/bin:/Applications/OrbStack.app/Contents/MacOS/xbin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+
+WORKSPACES_DIR="${SERVER_DIR}/workspaces"
+BACKUPS_DIR="${SERVER_DIR}/backups"
+USERS_DB="${SERVER_DIR}/config/users.db"
+mkdir -p "$WORKSPACES_DIR" "$BACKUPS_DIR" "${SERVER_DIR}/config"
+touch "$USERS_DB"
+
+CYAN="\033[96m"
+GREEN="\033[92m"
+YELLOW="\033[93m"
+RED="\033[91m"
+BOLD="\033[1m"
+RESET="\033[0m"
+
+banner() {
+    echo -e "${CYAN}${BOLD}"
+    echo "╔══════════════════════════════════════════════════════════════════════════╗"
+    echo "║   🏢 OPENRIG SERVER — MULTI-TENANT WORKSTATION ORCHESTRATOR              ║"
+    echo "║   By Linux Open Source S.A. de C.V.                                      ║"
+    echo "╚══════════════════════════════════════════════════════════════════════════╝"
+    echo -e "${RESET}"
+}
+
+next_free_port() {
+    local port=2201
+    while grep -q ":${port}:" "$USERS_DB" 2>/dev/null || lsof -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; do
+        port=$((port + 1))
+    done
+    echo "$port"
+}
+
+cmd_user_create() {
+    local username="${1:?Uso: rig-server user create <usuario> [--role fullstack] [--ram 4g] [--cpus 2] [--port 2201] [--ssh-key '<pubkey>']}"
+    shift || true
+
+    local role="fullstack"
+    local ram="4g"
+    local cpus="2"
+    local port
+    port=$(next_free_port)
+    local ssh_key=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --role)    role="$2"; shift 2 ;;
+            --ram)     ram="$2"; shift 2 ;;
+            --cpus)    cpus="$2"; shift 2 ;;
+            --port)    port="$2"; shift 2 ;;
+            --ssh-key) ssh_key="$2"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+
+    # Default to host user's public key if none passed
+    if [ -z "$ssh_key" ]; then
+        if command -v ssh-add >/dev/null 2>&1 && ssh-add -L >/dev/null 2>&1; then
+            ssh_key=$(ssh-add -L | head -n 1)
+        elif [ -f "$HOME/.ssh/id_ed25519.pub" ]; then
+            ssh_key=$(cat "$HOME/.ssh/id_ed25519.pub")
+        fi
+    fi
+
+    local container_name="openrig-user-${username}"
+    local net_name="openrig-net-${username}"
+    local user_ws="${WORKSPACES_DIR}/${username}"
+    mkdir -p "$user_ws"
+
+    echo -e "${CYAN}🚀 Aprovisionando estación aislada para '${username}' (Rol: ${role}, RAM: ${ram}, CPUs: ${cpus}, SSH Port: ${port})...${RESET}"
+
+    docker network inspect "$net_name" >/dev/null 2>&1 || docker network create "$net_name" >/dev/null
+
+    docker rm -f "$container_name" >/dev/null 2>&1 || true
+
+    docker run -d \
+        --name "$container_name" \
+        --hostname "rig-${username}" \
+        --network "$net_name" \
+        --memory "$ram" \
+        --memory-swap "$ram" \
+        --cpus "$cpus" \
+        --pids-limit 512 \
+        --cap-add NET_ADMIN \
+        --device /dev/net/tun:/dev/net/tun \
+        -e OPENRIG_SSH_SERVER=true \
+        -e AUTHORIZED_SSH_KEY="$ssh_key" \
+        -p "${port}:22" \
+        -v "${user_ws}:/workspace" \
+        -v "openrig-home-${username}:/home/rig/.openrig-profiles" \
+        "openrig:${role}" >/dev/null
+
+    # Record in users.db
+    sed -i.bak "/^${username}:/d" "$USERS_DB" 2>/dev/null || true
+    rm -f "${USERS_DB}.bak"
+    echo "${username}:${port}:${role}:${ram}:${cpus}:$(date +%Y-%m-%d)" >> "$USERS_DB"
+
+    local server_ip
+    server_ip=$(ipconfig getifaddr en0 2>/dev/null || hostname -I 2>/dev/null | awk '{print $1}' || echo "127.0.0.1")
+    [ -z "$server_ip" ] && server_ip="127.0.0.1"
+
+    echo -e "${GREEN}✅ Estación '${container_name}' activa en el puerto SSH ${port}.${RESET}"
+    echo ""
+    echo -e "${BOLD}📋 Comando de conexión para el desarrollador (en su laptop, sin necesitar Docker):${RESET}"
+    echo -e "   ${CYAN}rig connect ${server_ip}:${port} openrig-${username}${RESET}"
+    echo -e "   (o por SSH directo: ${CYAN}ssh -p ${port} rig@${server_ip}${RESET})"
+}
+
+cmd_user_list() {
+    banner
+    echo -e "${BOLD}Usuarios aprovisionados y uso de recursos en tiempo real:${RESET}\n"
+    printf "%-18s %-10s %-14s %-8s %-8s %-20s\n" "USUARIO" "PUERTO" "ROL" "RAM LÍM" "CPUS" "ESTADO CONTENEDOR"
+    echo "----------------------------------------------------------------------------------------"
+    while IFS=: read -r user port role ram cpus created; do
+        [ -z "$user" ] && continue
+        local cname="openrig-user-${user}"
+        local st
+        st=$(docker inspect -f '{{.State.Status}}' "$cname" 2>/dev/null || echo "not-found")
+        printf "%-18s %-10s %-14s %-8s %-8s %-20s\n" "$user" "$port" "$role" "$ram" "$cpus" "$st"
+    done < "$USERS_DB"
+    echo ""
+    docker stats --no-stream --format "table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.NetIO}}" $(docker ps --filter "name=openrig-user-" -q) 2>/dev/null || true
+}
+
+cmd_user_action() {
+    local act="$1"
+    local username="${2:?Falta el nombre de usuario}"
+    local cname="openrig-user-${username}"
+    case "$act" in
+        stop)
+            docker stop "$cname" >/dev/null
+            echo -e "${YELLOW}⏸️  Estación de '${username}' pausada/detenida.${RESET}"
+            ;;
+        start)
+            docker start "$cname" >/dev/null
+            echo -e "${GREEN}▶️  Estación de '${username}' iniciada.${RESET}"
+            ;;
+        remove|delete)
+            docker rm -f "$cname" >/dev/null 2>&1 || true
+            docker network rm "openrig-net-${username}" >/dev/null 2>&1 || true
+            sed -i.bak "/^${username}:/d" "$USERS_DB" 2>/dev/null || true
+            rm -f "${USERS_DB}.bak"
+            echo -e "${GREEN}🗑️  Contenedor de '${username}' eliminado (su código sigue respaldado en workspaces/${username}).${RESET}"
+            ;;
+    esac
+}
+
+cmd_backup() {
+    local username="${1:?Uso: rig-server backup <usuario>}"
+    local ts
+    ts=$(date +%Y%m%d_%H%M%S)
+    local out="${BACKUPS_DIR}/${username}_workspace_${ts}.tar.gz"
+    echo -e "${CYAN}📦 Respaldando workspace de '${username}' en ${out}...${RESET}"
+    tar -czf "$out" -C "$WORKSPACES_DIR" "$username"
+    echo -e "${GREEN}✅ Respaldo completado: ${out}${RESET}"
+}
+
+cmd_scale() {
+    local username="${1:?Uso: rig-server scale <usuario> --ram <ej: 8g> --cpus <ej: 4>}"
+    shift || true
+    local new_ram=""
+    local new_cpus=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --ram)  new_ram="$2"; shift 2 ;;
+            --cpus) new_cpus="$2"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+
+    if [ -z "$new_ram" ] && [ -z "$new_cpus" ]; then
+        echo -e "${RED}Uso: rig-server scale <usuario> --ram <8g> [--cpus <4>]${RESET}"
+        exit 1
+    fi
+
+    local cname="openrig-user-${username}"
+    local update_args=()
+    [ -n "$new_ram" ] && update_args+=(--memory "$new_ram" --memory-swap "$new_ram")
+    [ -n "$new_cpus" ] && update_args+=(--cpus "$new_cpus")
+
+    echo -e "${CYAN}⚡ Escalando hardware virtual en caliente (Hot-Scale sin reiniciar sesión) para '${username}'...${RESET}"
+    docker update "${update_args[@]}" "$cname" >/dev/null
+
+    # Update users.db record
+    python3 - "$USERS_DB" "$username" "$new_ram" "$new_cpus" << 'PY'
+import sys
+db_path, user, n_ram, n_cpus = sys.argv[1:]
+lines = []
+for line in open(db_path).read().splitlines():
+    if line.startswith(f"{user}:"):
+        parts = line.split(":")
+        if n_ram: parts[3] = n_ram
+        if n_cpus: parts[4] = n_cpus
+        line = ":".join(parts)
+    lines.append(line)
+open(db_path, "w").write("\n".join(lines) + "\n")
+PY
+
+    # Clear pending hardware request if exists
+    rm -f "${WORKSPACES_DIR}/${username}/.openrig-hardware-request.json" 2>/dev/null || true
+
+    echo -e "${GREEN}✅ Hardware de '${username}' actualizado en vivo (RAM: ${new_ram:-sin cambio} | CPUs: ${new_cpus:-sin cambio}).${RESET}"
+}
+
+cmd_requests() {
+    banner
+    echo -e "${BOLD}📨 Solicitudes pendientes de ampliación de Hardware Virtual (enviadas por usuarios):${RESET}\n"
+    local found=0
+    for req in "${WORKSPACES_DIR}"/*/.openrig-hardware-request.json; do
+        [ -f "$req" ] || continue
+        found=1
+        local user
+        user=$(basename "$(dirname "$req")")
+        python3 - "$user" "$req" << 'PY'
+import json, sys
+u, p = sys.argv[1], sys.argv[2]
+d = json.loads(open(p).read())
+print(f"  👤 Usuario: {u}")
+print(f"     • Solicita: {d.get('requested_ram')} RAM | {d.get('requested_cpus')} CPUs")
+print(f"     • Motivo:   {d.get('reason')} ({d.get('timestamp')})")
+print(f"     👉 Para aprobar en caliente: rig-server scale {u} --ram {d.get('requested_ram')} --cpus {d.get('requested_cpus')}\n")
+PY
+    done
+    [ "$found" -eq 0 ] && echo "  (No hay solicitudes pendientes en este momento)"
+    return 0
+}
+
+cmd_create_wizard() {
+    local username="${1:-}"
+    shift || true
+    if [ $# -gt 0 ]; then
+        # Direct CLI mode: provision + create invite
+        cmd_user_create "$username" "$@"
+        cmd_invite create --user "$username" "$@"
+        return 0
+    fi
+    banner
+    echo -e "${BOLD}🛠️  Asistente del Administrador: Crear Nueva Máquina Virtual / Contenedor para Usuario${RESET}\n"
+    [ -z "$username" ] && read -r -p "👤 Nombre del usuario (ej. carlos): " username
+    echo ""
+    echo "Selecciona el Perfil de Skills que pidió el usuario:"
+    echo "  1) 🐍 Backend Python     (pyenv, uv, Django, Flask, FastAPI)"
+    echo "  2) ☕ Backend JVM        (SDKMAN!, Java 21, Kotlin, Spring Boot, Maven, Gradle)"
+    echo "  3) 🎨 Frontend & Web     (nvm, Node, Vue.js, React, Vite)"
+    echo "  4) 📱 Mobile & Flutter   (Flutter, Dart, Android SDK CLI)"
+    echo "  5) 🛡️  DevSecOps & Pentest(nmap, nuclei, trivy, semgrep, gitleaks, AWS CLI)"
+    echo "  6) 🦾 Full-Stack Core    (Todos los lenguajes + Cloud + Security + IA)"
+    read -r -p "👉 Rol [1-6] (default: 6): " r_choice
+    local role="fullstack"
+    case "${r_choice:-6}" in
+        1) role="backend-python" ;;
+        2) role="backend-jvm" ;;
+        3) role="frontend" ;;
+        4) role="mobile" ;;
+        5) role="sec-devops" ;;
+        *) role="fullstack" ;;
+    esac
+
+    echo ""
+    read -r -p "🧠 Memoria RAM virtual asignada (ej. 2g, 4g, 8g) [default: 4g]: " ram
+    ram="${ram:-4g}"
+    read -r -p "⚡ Núcleos de CPU virtuales asignados (ej. 1, 2, 4) [default: 2]: " cpus
+    cpus="${cpus:-2}"
+
+    cmd_user_create "$username" --role "$role" --ram "$ram" --cpus "$cpus"
+    echo ""
+    cmd_invite create --user "$username" --role "$role" --ram "$ram" --cpus "$cpus"
+}
+
+cmd_invite() {
+    local sub="${1:-create}"
+    shift || true
+    case "$sub" in
+        create|add)
+            local username=""
+            local role="fullstack"
+            local ram="4g"
+            local cpus="2"
+            local ttl_hours=24
+            local replace_prev="true"
+
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    --user)    username="$2"; shift 2 ;;
+                    --role)    role="$2"; shift 2 ;;
+                    --ram)     ram="$2"; shift 2 ;;
+                    --cpus)    cpus="$2"; shift 2 ;;
+                    --ttl)     ttl_hours="$2"; shift 2 ;;
+                    --add-device) replace_prev="false"; shift ;;
+                    *) [ -z "$username" ] && username="$1"; shift ;;
+                esac
+            done
+
+            if [ -z "$username" ]; then
+                echo -e "${RED}Uso: rig-server invite create --user <nombre> [--role fullstack] [--ram 4g] [--cpus 2] [--add-device]${RESET}"
+                exit 1
+            fi
+
+            # Ensure Gatekeeper is running on port 7070
+            if ! lsof -iTCP:7070 -sTCP:LISTEN >/dev/null 2>&1; then
+                nohup python3 "${SERVER_DIR}/gatekeeper.py" >/tmp/openrig-gatekeeper.log 2>&1 &
+                sleep 1
+            fi
+
+            local token
+            token="rig_inv_$(openssl rand -hex 16)"
+            python3 - "$SERVER_DIR/config/invites.json" "$token" "$username" "$role" "$ram" "$cpus" "$ttl_hours" "$replace_prev" << 'PY'
+import json, sys, time
+path, token, user, role, ram, cpus, ttl, rep = sys.argv[1:]
+data = json.loads(open(path).read() or "{}")
+data[token] = {
+    "username": user,
+    "role": role,
+    "ram": ram,
+    "cpus": cpus,
+    "replace_previous": rep == "true",
+    "used": False,
+    "created_at": int(time.time()),
+    "expires_at": int(time.time()) + int(ttl) * 3600
+}
+open(path, "w").write(json.dumps(data, indent=2))
+PY
+            local server_ip
+            server_ip=$(ipconfig getifaddr en0 2>/dev/null || echo "127.0.0.1")
+            [ -z "$server_ip" ] && server_ip="127.0.0.1"
+
+            echo -e "${GREEN}🎟️  Invitación de 1 solo uso generada para '${username}' (Expira en ${ttl_hours}h):${RESET}"
+            echo -e "   • Rol: ${role} | Cuota: ${ram} RAM, ${cpus} CPUs | Revoca PC anterior: ${replace_prev}"
+            echo ""
+            echo -e "${BOLD}👉 Comparte este comando con '${username}' para que case su computadora:${RESET}"
+            echo -e "   ${CYAN}rig join ${server_ip}:7070 --token ${token}${RESET}"
+            ;;
+        list|ls)
+            python3 - "$SERVER_DIR/config/invites.json" << 'PY'
+import json, sys
+data = json.loads(open(sys.argv[1]).read() or "{}")
+print(f"{'TOKEN':<42} {'USUARIO':<14} {'ESTADO':<12} {'EQUIPO CASADO'}")
+print("-" * 86)
+for k, v in data.items():
+    st = "USADO" if v.get("used") else "PENDIENTE"
+    dev = f"{v.get('bound_device','-')} ({v.get('bound_hw_id','-')})" if v.get("used") else "-"
+    print(f"{k:<42} {v['username']:<14} {st:<12} {dev}")
+PY
+            ;;
+    esac
+}
+
+ACTION="${1:-help}"
+shift || true
+
+case "$ACTION" in
+    user)
+        SUB="${1:-list}"
+        shift || true
+        case "$SUB" in
+            create|add)    cmd_user_create "$@" ;;
+            list|ls)       cmd_user_list ;;
+            stop|start|remove|delete) cmd_user_action "$SUB" "$@" ;;
+            *) echo "Uso: rig-server user [create|list|stop|start|remove]" ;;
+        esac
+        ;;
+    status|list|ps) cmd_user_list ;;
+    create|new)     cmd_create_wizard "$@" ;;
+    scale|resize)   cmd_scale "$@" ;;
+    requests|reqs)  cmd_requests ;;
+    invite|inv)     cmd_invite "$@" ;;
+    backup)         cmd_backup "$@" ;;
+    *)
+        banner
+        echo -e "${BOLD}Comandos del Administrador (OpenRig-Server):${RESET}"
+        echo "  rig-server create [user]         -> Asistente para crear máquina con Skills + RAM/CPU + Invitación"
+        echo "  rig-server scale <user> --ram 8g --cpus 4 -> Sube o baja RAM/CPU EN CALIENTE sin apagar su sesión"
+        echo "  rig-server requests              -> Ver solicitudes de más RAM/CPU enviadas por los usuarios"
+        echo "  rig-server invite create --user <user> [--role fullstack] [--ram 4g] [--cpus 2]"
+        echo "  rig-server invite list           -> Muestra invitaciones y el Hardware ID casado por usuario"
+        echo "  rig-server status                -> Dashboard de usuarios, puertos, límites y consumo en vivo"
+        echo "  rig-server user [stop|start|remove] <user>"
+        echo "  rig-server backup <user>         -> Genera respaldo .tar.gz del workspace del desarrollador"
+        ;;
+esac
