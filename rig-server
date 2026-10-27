@@ -91,6 +91,8 @@ cmd_user_create() {
         --name "$container_name" \
         --hostname "rig-${username}" \
         --network "$net_name" \
+        --add-host "host.docker.internal:host-gateway" \
+        --ipc "private" \
         --memory "$ram" \
         --memory-swap "$ram" \
         --cpus "$cpus" \
@@ -104,6 +106,8 @@ cmd_user_create() {
         -v "${user_ws}:/workspace" \
         -v "openrig-home-${username}:/home/rig/.openrig-profiles" \
         "openrig:${role}" >/dev/null
+
+    provision_worker_ai_ticket "$username" || true
 
     # Record in users.db
     sed -i.bak "/^${username}:/d" "$USERS_DB" 2>/dev/null || true
@@ -360,6 +364,223 @@ PY
     esac
 }
 
+cmd_dlp() {
+    local username="${1:?Usage: rig-server dlp <username> --mode [sanitized|approval|airgapped] [--block-terms 'term1,term2']}"
+    shift || true
+    local mode="sanitized"
+    local terms=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --mode)        mode="$2"; shift 2 ;;
+            --block-terms) terms="$2"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+    local cname="openrig-user-${username}"
+    local policy_json
+    policy_json=$(python3 - "$username" "$mode" "$terms" << 'PY'
+import json, sys
+u, m, t = sys.argv[1], sys.argv[2], sys.argv[3]
+bl = [x.strip() for x in t.split(",") if x.strip()]
+print(json.dumps({"tenant_user": f"rig-{u}", "dlp_mode": m, "blocked_terms": bl}, indent=2))
+PY
+)
+    docker exec -u root "$cname" bash -c "mkdir -p /etc/openrig && cat << 'EOP' > /etc/openrig/dlp-policy.json
+${policy_json}
+EOP
+chown root:root /etc/openrig/dlp-policy.json && chmod 644 /etc/openrig/dlp-policy.json"
+    echo -e "${GREEN}🛡️  Enterprise DLP Policy updated for '${username}' (${cname}):${RESET}"
+    echo -e "   • DLP Mode:      ${BOLD}${mode}${RESET}"
+    echo -e "   • Blocked Terms: ${terms:-none}"
+}
+
+cmd_brain_requests() {
+    local sub="${1:-list}"
+    shift || true
+    case "$sub" in
+        approve)
+            local username="${1:?Usage: rig-server brain-requests approve <username>}"
+            local req="${WORKSPACES_DIR}/${username}/.openrig-brain-export.json"
+            if [ ! -f "$req" ]; then
+                echo -e "${RED}❌ No pending brain export request for '${username}'.${RESET}"
+                exit 1
+            fi
+            local fname content
+            fname=$(python3 -c "import json,sys; print(json.loads(open(sys.argv[1]).read())['filename'])" "$req")
+            content=$(python3 -c "import json,sys; print(json.loads(open(sys.argv[1]).read())['content'])" "$req")
+            docker exec "openrig-user-${username}" bash -c "chmod u+w /dev/shm/.personal-core 2>/dev/null || true; mkdir -p /dev/shm/.personal-core/.outbox && cat << 'EOC' > /dev/shm/.personal-core/.outbox/${fname}
+${content}
+EOC"
+            rm -f "$req"
+            echo -e "${GREEN}✅ Brain learning '${fname}' approved for '${username}' and placed in their isolated RAM outbox.${RESET}"
+            ;;
+        reject)
+            local username="${1:?Usage: rig-server brain-requests reject <username>}"
+            rm -f "${WORKSPACES_DIR}/${username}/.openrig-brain-export.json"
+            echo -e "${YELLOW}🗑️  Brain export request for '${username}' rejected and removed.${RESET}"
+            ;;
+        *)
+            banner
+            echo -e "${BOLD}🧠 Pending Enterprise Brain Graduation Requests (DLP Mode = approval):${RESET}\n"
+            local found=0
+            for req in "${WORKSPACES_DIR}"/*/.openrig-brain-export.json; do
+                [ -f "$req" ] || continue
+                found=1
+                local user
+                user=$(basename "$(dirname "$req")")
+                python3 - "$user" "$req" << 'PY'
+import json, sys
+u, p = sys.argv[1], sys.argv[2]
+d = json.loads(open(p).read())
+print(f"  👤 User: {u} | File: {d.get('filename')} ({d.get('timestamp')})")
+print("  ------------------------------------------------------------------------")
+for line in d.get("content", "").splitlines()[:12]:
+    print(f"    {line}")
+print(f"\n  👉 Approve: rig-server brain-requests approve {u}")
+print(f"  👉 Reject:  rig-server brain-requests reject {u}\n")
+PY
+            done
+            [ "$found" -eq 0 ] && echo "  (No pending brain graduation requests at the moment)"
+            ;;
+    esac
+}
+
+AI_BROKER_FILE="${SERVER_DIR}/config/ai-broker.json"
+
+provision_worker_ai_ticket() {
+    local username="$1"
+    local cname="openrig-user-${username}"
+    python3 - "$AI_BROKER_FILE" "$username" << 'PY' > /tmp/openrig-ai-env.$$
+import json, os, secrets, sys
+
+cfg_path, user = sys.argv[1], sys.argv[2]
+if os.path.isfile(cfg_path):
+    cfg = json.loads(open(cfg_path).read() or "{}")
+else:
+    cfg = {"provider": "bedrock", "policy": "hybrid", "region": "us-east-1", "aws_profile": "default", "api_key": "", "upstream_url": "", "tickets": {}}
+
+tickets = cfg.setdefault("tickets", {})
+existing_ticket = None
+for tk, info in tickets.items():
+    if info.get("username") == user:
+        existing_ticket = tk
+        break
+
+if not existing_ticket:
+    existing_ticket = f"rig_ai_ticket_{user}_{secrets.token_hex(12)}"
+    tickets[existing_ticket] = {"username": user, "active": True, "requests": 0}
+
+open(cfg_path, "w").write(json.dumps(cfg, indent=2))
+os.chmod(cfg_path, 0o600)
+
+prov = cfg.get("provider", "bedrock")
+pol = cfg.get("policy", "hybrid")
+reg = cfg.get("region", "us-east-1")
+print(f'OPENRIG_AI_PROVIDER="{prov}"')
+print(f'OPENRIG_AI_POLICY="{pol}"')
+print(f'OPENRIG_AI_BROKER_URL="http://host.docker.internal:7070/ai/{prov}"')
+print(f'OPENRIG_AI_TICKET="{existing_ticket}"')
+print(f'AWS_REGION="{reg}"')
+PY
+    docker exec -u root "$cname" bash -c "mkdir -p /etc/openrig && cat /dev/stdin > /etc/openrig/ai-corporate.env && chown root:root /etc/openrig/ai-corporate.env && chmod 644 /etc/openrig/ai-corporate.env" < /tmp/openrig-ai-env.$$ 2>/dev/null || true
+    rm -f /tmp/openrig-ai-env.$$
+}
+
+cmd_ai() {
+    local sub="${1:-status}"
+    shift || true
+    case "$sub" in
+        set|configure)
+            local prov="bedrock"
+            local pol="hybrid"
+            local reg="us-east-1"
+            local aws_prof="default"
+            local key=""
+            local url=""
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    --provider)    prov="$2"; shift 2 ;;
+                    --policy)      pol="$2"; shift 2 ;;
+                    --region)      reg="$2"; shift 2 ;;
+                    --aws-profile) aws_prof="$2"; shift 2 ;;
+                    --key)         key="$2"; shift 2 ;;
+                    --url)         url="$2"; shift 2 ;;
+                    *) shift ;;
+                esac
+            done
+            python3 - "$AI_BROKER_FILE" "$prov" "$pol" "$reg" "$aws_prof" "$key" "$url" << 'PY'
+import json, os, sys
+p, prov, pol, reg, aws_prof, key, url = sys.argv[1:]
+cfg = json.loads(open(p).read()) if os.path.isfile(p) else {"tickets": {}}
+cfg.update({
+    "provider": prov,
+    "policy": pol,
+    "region": reg,
+    "aws_profile": aws_prof,
+    "api_key": key,
+    "upstream_url": url
+})
+open(p, "w").write(json.dumps(cfg, indent=2))
+os.chmod(p, 0o600)
+PY
+            while IFS=: read -r u _rest; do
+                [ -n "$u" ] && provision_worker_ai_ticket "$u" || true
+            done < "$USERS_DB"
+            echo -e "${GREEN}🤖 [OpenRig AI Broker] Shared Corporate AI configured on Server Host (0600 vault):${RESET}"
+            echo -e "   • Provider:        ${BOLD}${prov}${RESET} (Region: ${reg} | AWS Profile: ${aws_prof})"
+            echo -e "   • Tenant Policy:   ${BOLD}${pol}${RESET} (hybrid = Corporate + RAM Personal | corporate-only = locks to Corporate AI)"
+            echo -e "   • Key Exposure:    ${GREEN}ZERO${RESET} (Workers only receive internal broker tickets 'rig_ai_ticket_<user>_...')"
+            ;;
+        pause|revoke)
+            local username="${1:?Usage: rig-server ai pause <username>}"
+            python3 - "$AI_BROKER_FILE" "$username" "False" << 'PY'
+import json, sys
+p, u, st = sys.argv[1], sys.argv[2], sys.argv[3] == "True"
+cfg = json.loads(open(p).read())
+for tk, info in cfg.get("tickets", {}).items():
+    if info.get("username") == u:
+        info["active"] = st
+open(p, "w").write(json.dumps(cfg, indent=2))
+PY
+            echo -e "${YELLOW}⏸️  Corporate AI Broker access paused for '${username}'.${RESET}"
+            ;;
+        resume|enable)
+            local username="${1:?Usage: rig-server ai resume <username>}"
+            python3 - "$AI_BROKER_FILE" "$username" "True" << 'PY'
+import json, sys
+p, u, st = sys.argv[1], sys.argv[2], sys.argv[3] == "True"
+cfg = json.loads(open(p).read())
+for tk, info in cfg.get("tickets", {}).items():
+    if info.get("username") == u:
+        info["active"] = st
+open(p, "w").write(json.dumps(cfg, indent=2))
+PY
+            echo -e "${GREEN}▶️  Corporate AI Broker access resumed for '${username}'.${RESET}"
+            ;;
+        status|*)
+            banner
+            echo -e "${BOLD}🤖 OpenRig Zero-Key Corporate AI Broker Status:${RESET}\n"
+            python3 - "$AI_BROKER_FILE" << 'PY'
+import json, os, sys
+p = sys.argv[1]
+if not os.path.isfile(p):
+    print("  (AI Broker not configured yet. Run: rig-server ai set --provider bedrock --region us-east-1)")
+    sys.exit(0)
+cfg = json.loads(open(p).read())
+has_key = "Configured (0600 Host Vault)" if cfg.get("api_key") else f"AWS SigV4 Host Profile ({cfg.get('aws_profile','default')})"
+print(f"  • Upstream Provider: {cfg.get('provider','bedrock').upper()} (Region: {cfg.get('region','us-east-1')})")
+print(f"  • Host Auth Method:  {has_key}")
+print(f"  • Worker Policy:     {cfg.get('policy','hybrid').upper()}")
+print(f"\n  {'USERNAME':<16} {'TICKET STATUS':<16} {'AI REQUESTS':<14} {'LAST USED'}")
+print("  " + "-" * 68)
+for tk, info in cfg.get("tickets", {}).items():
+    st = "ACTIVE" if info.get("active") else "PAUSED"
+    print(f"  {info.get('username','-'):<16} {st:<16} {info.get('requests',0):<14} {info.get('last_used_at','never')}")
+PY
+            ;;
+    esac
+}
+
 ACTION="${1:-help}"
 shift || true
 
@@ -374,18 +595,25 @@ case "$ACTION" in
             *) echo "Usage: rig-server user [create|list|stop|start|remove]" ;;
         esac
         ;;
-    status|list|ps) cmd_user_list ;;
-    create|new)     cmd_create_wizard "$@" ;;
-    scale|resize)   cmd_scale "$@" ;;
-    requests|reqs)  cmd_requests ;;
-    invite|inv)     cmd_invite "$@" ;;
-    backup)         cmd_backup "$@" ;;
-    *)
+    status|list|ps)       cmd_user_list ;;
+    create|new)           cmd_create_wizard "$@" ;;
+    scale|resize)         cmd_scale "$@" ;;
+    requests|reqs)        cmd_requests ;;
+    dlp)                  cmd_dlp "$@" ;;
+    brain-requests|breqs) cmd_brain_requests "$@" ;;
+    ai)                   cmd_ai "$@" ;;
+    invite|inv)           cmd_invite "$@" ;;
+    backup)               cmd_backup "$@" ;;
+    help|-h|--help|*)
         banner
+        echo -e "${GREEN}${BOLD}📍 Context: SERVER ADMINISTRATOR CLI (OpenRig-Server Multi-Tenant Hub)${RESET}\n"
         echo -e "${BOLD}Server Manager Commands (OpenRig-Server):${RESET}"
-        echo "  rig-server create [user]         -> Wizard to create workstation with Skills + RAM/CPU + Invite"
+        echo "  rig-server create [user]         -> Wizard to create isolated workstation (--ipc=private) + Invite"
         echo "  rig-server scale <user> --ram 8g --cpus 4 -> Hot-scale RAM/CPU LIVE without restarting session"
         echo "  rig-server requests              -> View pending RAM/CPU upgrade requests from users"
+        echo "  rig-server ai [set|status|pause|resume] -> Manage Shared Zero-Key Corporate AI Broker (Bedrock/Anthropic/Gemini/OpenAI)"
+        echo "  rig-server dlp <user> --mode [sanitized|approval|airgapped] [--block-terms 'corp,secret']"
+        echo "  rig-server brain-requests        -> Review, approve, or reject user 'rig brain learn' exports"
         echo "  rig-server invite create --user <user> [--role fullstack] [--ram 4g] [--cpus 2]"
         echo "  rig-server invite list           -> List invitations and bound Hardware IDs per user"
         echo "  rig-server status                -> Dashboard of users, ports, quotas, and live consumption"

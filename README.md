@@ -116,6 +116,32 @@ On the **OpenRig-Server Host**, the Administrator reviews and approves the reque
 ./rig-server backup all
 ```
 
+### 5. Multi-Tenant Split-Brain Isolation & Enterprise DLP Governance (`rig-server dlp`)
+Every tenant container runs with an isolated kernel IPC namespace (`--ipc=private`), dedicated bridge network (`openrig-net-<user>`), and a root-owned DLP policy (`/etc/openrig/dlp-policy.json`):
+```bash
+# 1. Configure Enterprise DLP mode (sanitized | approval | airgapped) and blocked corporate terms:
+./rig-server dlp luis --mode approval --block-terms "acme-corp,payments-core,internal.acme"
+
+# 2. Review, approve, or reject pending 'rig brain learn' graduation requests from developers:
+./rig-server brain-requests
+./rig-server brain-requests approve luis
+```
+
+### 6. Shared Zero-Key Corporate AI Broker (`rig-server ai`)
+Share a corporate **AWS Bedrock, Anthropic, Google Gemini, OpenAI, or LiteLLM** account across all worker containers **without ever exposing the company's API keys or AWS IAM credentials inside the containers**. Workers authenticate to the Host AI Broker (`http://host.docker.internal:7070/ai/<provider>`) using an internal ticket (`rig_ai_ticket_<user>_...`) that is useless outside the server, while the Host Broker signs requests with **AWS SigV4 (`botocore`)** or injects the master key in memory:
+```bash
+# Option A: Share Corporate AWS Bedrock using the Server Host's AWS Profile / IAM Role (Zero AWS keys in containers):
+./rig-server ai set --provider bedrock --region us-east-1 --aws-profile default --policy hybrid
+
+# Option B: Share Corporate Anthropic / Gemini / OpenAI Master Key (stored in 0600 Host Vault):
+./rig-server ai set --provider anthropic --key "sk-ant-..." --policy corporate-only
+
+# Monitor AI request counts per worker or pause/resume a worker's AI access:
+./rig-server ai status
+./rig-server ai pause luis
+./rig-server ai resume luis
+```
+
 ---
 
 ## 📋 Complete Command Reference (`rig-server`)
@@ -125,6 +151,9 @@ On the **OpenRig-Server Host**, the Administrator reviews and approves the reque
 | `rig-server create [user] [--role R] [--ram M] [--cpus C]` | Interactive wizard or CLI to provision a user workstation with skills, virtual hardware & single-use invite token |
 | `rig-server scale <user> --ram <M> --cpus <C>` | **Hot-scale** virtual RAM and vCPUs in real time (`docker update`) without restarting the user's session |
 | `rig-server requests` | View pending virtual hardware upgrade requests submitted by users (`rig request`) |
+| `rig-server ai [set \| status \| pause \| resume]` | Configure Shared Zero-Key Corporate AI Broker (AWS Bedrock SigV4 / Anthropic / Gemini / OpenAI) & monitor per-user AI usage |
+| `rig-server dlp <user> --mode <M> [--block-terms <T>]` | Enforce Enterprise DLP policy (`sanitized`, `approval`, or `airgapped`) and blocked corporate keywords per tenant |
+| `rig-server brain-requests [approve \| reject] [user]` | Review, approve, or reject pending `rig brain learn` exports when a tenant is in `approval` mode |
 | `rig-server invite create --user <u > [--replace]` | Generate a new single-use enrollment token (with `--replace` to unlink old hardware) |
 | `rig-server invite list` / `revoke <token>` | List or revoke active invitation tokens |
 | `rig-server status` | Display provisioned tenants, SSH ports, quotas, and live `docker stats` |
