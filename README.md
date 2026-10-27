@@ -89,6 +89,15 @@ This outputs a single-use enrollment command to share with the developer:
 ```
 
 ### 3. Inspect Upgrade Requests & Hot-Scale Live (`rig-server requests` / `rig-server scale`)
+From inside their connected remote container (`rig connect openrig-luis`), developers can inspect their live cgroup v2 quota and request upgrades directly:
+```bash
+# Inside the connected container (rig-luis:/workspace):
+rig -h                                            # Shows in-container commands & live hardware quota
+rig request status                                # Shows live allocated RAM/vCPUs & pending requests
+rig request 8g 4 "Running heavy integration tests" # Submits upgrade request to Server Admin
+rig device [list | keychain | revoke <device>]    # Manage bound Hardware UUIDs & 1Password TOTP Keychain
+```
+On the **OpenRig-Server Host**, the Administrator reviews and approves the request in real time:
 ```bash
 # 1. Check pending virtual hardware requests submitted by developers (via 'rig request'):
 ./rig-server requests

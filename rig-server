@@ -98,6 +98,7 @@ cmd_user_create() {
         --cap-add NET_ADMIN \
         --device /dev/net/tun:/dev/net/tun \
         -e OPENRIG_SSH_SERVER=true \
+        -e OPENRIG_SERVER_TENANT=true \
         -e AUTHORIZED_SSH_KEY="$ssh_key" \
         -p "${port}:22" \
         -v "${user_ws}:/workspace" \
