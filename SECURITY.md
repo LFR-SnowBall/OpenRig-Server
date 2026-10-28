@@ -12,4 +12,4 @@
    - **Strict Input Validation:** Enforces `^[a-zA-Z0-9_-]{1,32}$` on usernames, roles, and device names to prevent command injection.
 
 ## 📬 Reporting a Vulnerability
-Report vulnerabilities privately to **Luis Fernando Real (`LFR-SnowBall`)** at `luisitoreal01@gmail.com` (**Linux Open Source S.A. de C.V.**).
+Report vulnerabilities privately to **Luis Fernando Real (`LFR-SnowBall`)** at `luisitoreal01@gmail.com`.

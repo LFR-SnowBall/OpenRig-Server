@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # 🏢 OpenRig-Server CLI — Enterprise Multi-Tenant Dev & Sec Workstation Hub
-# Vendor: Linux Open Source S.A. de C.V. / LFR-SnowBall
+# Author: Luis Fernando Real (LFR-SnowBall) <luisitoreal01@gmail.com>
 # ==============================================================================
 set -euo pipefail
 
@@ -32,7 +32,7 @@ banner() {
     echo -e "${CYAN}${BOLD}"
     echo "╔══════════════════════════════════════════════════════════════════════════╗"
     echo "║   🏢 OPENRIG SERVER — MULTI-TENANT WORKSTATION ORCHESTRATOR              ║"
-    echo "║   By Linux Open Source S.A. de C.V.                                      ║"
+    echo "║   Created by Luis Fernando Real (@LFR-SnowBall)                          ║"
     echo "╚══════════════════════════════════════════════════════════════════════════╝"
     echo -e "${RESET}"
 }

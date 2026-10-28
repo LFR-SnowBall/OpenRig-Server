@@ -2,7 +2,6 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
 [![Security: Red-Team Hardened](https://img.shields.io/badge/Security-Red--Team%20Hardened-critical.svg)](./SECURITY.md)
-[![By: Linux Open Source S.A. de C.V.](https://img.shields.io/badge/Organization-Linux%20Open%20Source%20S.A.%20de%20C.V.-0A66C2.svg)](#)
 
 **OpenRig-Server** is the central multi-tenant orchestrator and hardware-bound enrollment gatekeeper for [**OpenRig**](https://github.com/LFR-SnowBall/OpenRig). It enables organizations and engineering teams to turn any Linux or macOS server into a **centralized cloud of isolated developer & security workstations** where developers connect from lightweight laptops with **zero local Docker required**.
 
@@ -165,4 +164,4 @@ Share a corporate **AWS Bedrock, Anthropic, Google Gemini, OpenAI, or LiteLLM** 
 ## 📄 License
 
 Released under the [**MIT License**](./LICENSE).  
-Copyright © 2026 **Linux Open Source S.A. de C.V.** / **Luis Fernando Real (`LFR-SnowBall`)**.
+Copyright © 2026 **Luis Fernando Real (`LFR-SnowBall`)**.
