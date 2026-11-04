@@ -26,12 +26,13 @@ import time
 def find_docker_socket() -> str:
     candidates = [
         "/var/run/docker.sock",
+        "/mnt/wsl/rancher-desktop/run/docker.sock",
         os.path.expanduser("~/.orbstack/run/docker.sock"),
         os.path.expanduser("~/.docker/run/docker.sock"),
         "/var/run/docker/docker.sock"
     ]
     for c in candidates:
-        if os.path.exists(c):
+        if os.path.exists(c) and not os.path.isdir(c):
             return c
     return "/var/run/docker.sock"
 
@@ -371,12 +372,21 @@ def serve_user_socket(username: str, socket_path: str):
     os.makedirs(os.path.dirname(socket_path), exist_ok=True)
     if os.path.exists(socket_path):
         try:
-            os.unlink(socket_path)
+            if os.path.isdir(socket_path):
+                import shutil
+                shutil.rmtree(socket_path)
+            else:
+                os.unlink(socket_path)
         except OSError:
             pass
 
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    server.bind(socket_path)
+    try:
+        server.bind(socket_path)
+    except OSError as e:
+        print(f"❌ Failed to bind socket at {socket_path}: {e}", file=sys.stderr, flush=True)
+        sys.exit(1)
+
     os.chmod(socket_path, 0o666)  # Accessible by user container
     server.listen(128)
     print(f"🛡️  [OpenRig Docker Guard] Scoped socket active for '{username}': {socket_path}", flush=True)
