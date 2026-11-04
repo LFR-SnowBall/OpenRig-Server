@@ -38,7 +38,10 @@ if not AI_BROKER_FILE.exists():
         "upstream_url": "",
         "tickets": {}
     }, indent=2), encoding="utf-8")
-    os.chmod(AI_BROKER_FILE, 0o600)
+    try:
+        os.chmod(AI_BROKER_FILE, 0o600)
+    except Exception:
+        pass
 
 RE_SAFE_NAME = re.compile(r"^[a-zA-Z0-9._-]{2,32}$")
 RE_SAFE_HEX = re.compile(r"^[a-fA-F0-9]{32,128}$")
