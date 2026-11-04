@@ -38,6 +38,30 @@ get_server_ip() {
     echo "$ip"
 }
 
+get_server_hostname() {
+    local h
+    h=$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo "openrig-server")
+    h=$(echo "$h" | tr -d '\r\n ' | tr '[:upper:]' '[:lower:]')
+    echo "${h}.local"
+}
+
+ensure_gatekeeper() {
+    if docker ps --format '{{.Names}}' | grep -q "^openrig-gatekeeper$"; then
+        return 0
+    fi
+    docker rm -f openrig-gatekeeper >/dev/null 2>&1 || true
+    echo -e "${CYAN}🛡️  Starting OpenRig Gatekeeper container on port 7070...${RESET}"
+    docker run -d \
+        --name openrig-gatekeeper \
+        --restart unless-stopped \
+        -p 7070:7070 \
+        -v /var/run/docker.sock:/var/run/docker.sock \
+        -v "${SERVER_DIR}:/app" \
+        -w /app \
+        "openrig:fullstack" \
+        python3 /app/gatekeeper.py >/dev/null
+}
+
 SERVER_VERSION="1.1.0"
 [ -f "${SERVER_DIR}/VERSION" ] && SERVER_VERSION=$(cat "${SERVER_DIR}/VERSION" | tr -d '\r\n')
 
@@ -589,11 +613,8 @@ cmd_invite() {
                 exit 1
             fi
 
-            # Ensure Gatekeeper is running on port 7070
-            if ! lsof -iTCP:7070 -sTCP:LISTEN >/dev/null 2>&1 && ! ss -tlpn 2>/dev/null | grep -q ":7070 "; then
-                nohup python3 "${SERVER_DIR}/gatekeeper.py" >/tmp/openrig-gatekeeper.log 2>&1 &
-                sleep 1
-            fi
+            # Ensure Gatekeeper is running in Docker on port 7070
+            ensure_gatekeeper
 
             local token
             token="rig_inv_$(openssl rand -hex 16)"
@@ -613,14 +634,16 @@ data[token] = {
 }
 open(path, "w").write(json.dumps(data, indent=2))
 PY
-            local server_ip
+            local server_ip server_mDNS
             server_ip=$(get_server_ip)
+            server_mDNS=$(get_server_hostname)
 
             echo -e "${GREEN}🎟️  Single-use invitation generated for '${username}' (Expires in ${ttl_hours}h):${RESET}"
             echo -e "   • Role: ${role} | Quota: ${ram} RAM, ${cpus} CPUs | Revokes previous PC: ${replace_prev}"
             echo ""
-            echo -e "${BOLD}👉 Share this command with '${username}' to bind their computer:${RESET}"
-            echo -e "   ${CYAN}rig join ${server_ip}:7070 --token ${token}${RESET}"
+            echo -e "${BOLD}👉 Run on the client laptop to bind automatically (mDNS - immune to DHCP IP changes):${RESET}"
+            echo -e "   ${CYAN}rig join ${server_mDNS}:7070 --token ${token}${RESET}"
+            echo -e "   (or via direct IP fallback: ${CYAN}rig join ${server_ip}:7070 --token ${token}${RESET})"
             ;;
         list|ls)
             python3 - "$SERVER_DIR/config/invites.json" << 'PY'

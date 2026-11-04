@@ -225,6 +225,15 @@ class GatekeeperHandler(BaseHTTPRequestHandler):
         except Exception as exc:
             return self._send_json(502, {"error": f"AI Broker upstream error: {exc}"})
 
+    def do_GET(self):
+        if self.path in ("/health", "/ping", "/discover", "/"):
+            return self._send_json(200, {
+                "status": "online",
+                "service": "openrig-gatekeeper",
+                "version": "1.2.0"
+            })
+        return self._send_json(404, {"error": "Not found"})
+
     def do_POST(self):
         client_ip = self.client_address[0]
         if is_ip_rate_limited(client_ip):
