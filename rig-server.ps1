@@ -4,13 +4,6 @@
 Author: Luis Fernando Real (LFR-SnowBall) <luisitoreal01@gmail.com>
 #>
 
-param(
-    [Parameter(Position=0)]
-    [string]$Command = "help",
-    [Parameter(ValueFromRemainingArguments=$true)]
-    [string[]]$ArgsRest
-)
-
 # Prevent Git Bash / MSYS from converting Unix paths into Windows paths
 $env:MSYS_NO_PATHCONV = "1"
 $env:MSYS2_ARG_CONV_EXCL = "*"
@@ -42,7 +35,7 @@ if (Get-Command wsl.exe -ErrorAction SilentlyContinue) {
     $ubuntu = $distros | Where-Object { $_ -match 'Ubuntu' } | Select-Object -First 1
 
     if ($ubuntu) {
-        & wsl.exe -d $ubuntu bash -c "sed -i 's/\r$//' '$wslScript' 2>/dev/null; exec bash '$wslScript' `"$@`"" -- $Command @ArgsRest
+        & wsl.exe -d $ubuntu /bin/bash "$wslScript" @args
         exit $LASTEXITCODE
     }
 
@@ -54,7 +47,7 @@ if (Get-Command wsl.exe -ErrorAction SilentlyContinue) {
     } catch {}
 
     if ($defaultOk) {
-        & wsl.exe bash -c "sed -i 's/\r$//' '$wslScript' 2>/dev/null; exec bash '$wslScript' `"$@`"" -- $Command @ArgsRest
+        & wsl.exe /bin/bash "$wslScript" @args
         exit $LASTEXITCODE
     }
 }
@@ -68,7 +61,7 @@ $gitBashCandidates = @(
 
 foreach ($gb in $gitBashCandidates) {
     if (Test-Path $gb) {
-        & $gb "$winScript" $Command @ArgsRest
+        & $gb "$winScript" @args
         exit $LASTEXITCODE
     }
 }

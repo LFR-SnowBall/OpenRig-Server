@@ -130,20 +130,17 @@ function Convert-ToWslPath([string]$winPath) {
     return $winPath -replace '\\','/'
 }
 
-$gitBashCandidates = @(
-    "$env:ProgramFiles\Git\bin\bash.exe",
-    "${env:ProgramFiles(x86)}\Git\bin\bash.exe",
-    "$env:LOCALAPPDATA\Programs\Git\bin\bash.exe"
-)
-foreach ($gb in $gitBashCandidates) {
-    if (Test-Path $gb) {
-        & $gb "$winScript" $Command @ArgsRest
+# 1. Prefer WSL with Ubuntu (Provides real Linux environment with python3, lsof, background daemons)
+if (Get-Command wsl.exe -ErrorAction SilentlyContinue) {
+    $wslScript = Convert-ToWslPath $winScript
+    $distros = wsl.exe -l -q 2>$null | ForEach-Object { $_ -replace '\x00','' } | Where-Object { $_ -match '\S' }
+    $ubuntu = $distros | Where-Object { $_ -match 'Ubuntu' } | Select-Object -First 1
+
+    if ($ubuntu) {
+        & wsl.exe -d $ubuntu /bin/bash "$wslScript" @args
         exit $LASTEXITCODE
     }
-}
 
-if (Get-Command wsl -ErrorAction SilentlyContinue) {
-    $wslScript = Convert-ToWslPath $winScript
     $defaultOk = $false
     try {
         & wsl.exe bash -c "true" 2>$null
@@ -151,18 +148,24 @@ if (Get-Command wsl -ErrorAction SilentlyContinue) {
     } catch {}
 
     if ($defaultOk) {
-        & wsl.exe bash -c "sed -i 's/\r$//' '$wslScript' 2>/dev/null; exec bash '$wslScript' `"$@`"" -- $Command @ArgsRest
-        exit $LASTEXITCODE
-    }
-
-    $distros = wsl.exe -l -q 2>$null | ForEach-Object { $_ -replace '\x00','' } | Where-Object { $_ -match '\S' }
-    $ubuntu = $distros | Where-Object { $_ -match 'Ubuntu' } | Select-Object -First 1
-    if ($ubuntu) {
-        & wsl.exe -d $ubuntu bash -c "sed -i 's/\r$//' '$wslScript' 2>/dev/null; exec bash '$wslScript' `"$@`"" -- $Command @ArgsRest
+        & wsl.exe /bin/bash "$wslScript" @args
         exit $LASTEXITCODE
     }
 }
-Write-Host "❌ Git Bash or WSL with Ubuntu is required to run OpenRig-Server." -ForegroundColor Red
+
+# 2. Fallback to Git Bash if WSL is not available
+$gitBashCandidates = @(
+    "$env:ProgramFiles\Git\bin\bash.exe",
+    "${env:ProgramFiles(x86)}\Git\bin\bash.exe",
+    "$env:LOCALAPPDATA\Programs\Git\bin\bash.exe"
+)
+foreach ($gb in $gitBashCandidates) {
+    if (Test-Path $gb) {
+        & $gb "$winScript" @args
+        exit $LASTEXITCODE
+    }
+}
+Write-Host "❌ WSL (with Ubuntu) or Git Bash is required to run OpenRig-Server." -ForegroundColor Red
 exit 1
 '@
     [System.IO.File]::WriteAllText((Join-Path $serverDir "rig-server.ps1"), ($ps1Content -replace "`r`n", "`n"))
