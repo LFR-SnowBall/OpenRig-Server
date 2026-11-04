@@ -45,6 +45,24 @@ get_server_hostname() {
     echo "${h}.local"
 }
 
+ensure_docker_proxy() {
+    local username="$1"
+    local sock_path="$2"
+    local pid_file="${SERVER_DIR}/sockets/${username}.pid"
+    if [ -f "$pid_file" ] && kill -0 "$(cat "$pid_file" 2>/dev/null)" 2>/dev/null; then
+        return 0
+    fi
+    mkdir -p "${SERVER_DIR}/sockets"
+    rm -f "$sock_path" "$pid_file"
+    python3 "${SERVER_DIR}/docker-proxy.py" "$username" "$sock_path" >/dev/null 2>&1 &
+    echo $! > "$pid_file"
+    disown 2>/dev/null || true
+    for i in {1..20}; do
+        [ -S "$sock_path" ] && break
+        sleep 0.1
+    done
+}
+
 ensure_gatekeeper() {
     if docker ps --format '{{.Names}}' | grep -q "^openrig-gatekeeper$"; then
         return 0
@@ -178,6 +196,13 @@ cmd_user_create() {
         tun_opt=(--device /dev/net/tun:/dev/net/tun)
     fi
 
+    local sock_opt=()
+    if [ -S "/var/run/docker.sock" ]; then
+        local user_sock="${SERVER_DIR}/sockets/${username}.sock"
+        ensure_docker_proxy "$username" "$user_sock"
+        sock_opt=(-v "${user_sock}:/var/run/docker.sock")
+    fi
+
     if ! docker image inspect "openrig:${role}" >/dev/null 2>&1; then
         echo -e "${CYAN}🐳 Pre-warmed image 'openrig:${role}' not found locally. Pulling from registry...${RESET}"
         docker pull "ghcr.io/lfr-snowball/openrig:${role}" && docker tag "ghcr.io/lfr-snowball/openrig:${role}" "openrig:${role}" || true
@@ -195,8 +220,11 @@ cmd_user_create() {
         --pids-limit 512 \
         --cap-add NET_ADMIN \
         ${tun_opt[@]+"${tun_opt[@]}"} \
+        ${sock_opt[@]+"${sock_opt[@]}"} \
         -e OPENRIG_SSH_SERVER=true \
         -e OPENRIG_SERVER_TENANT=true \
+        -e OPENRIG_USER="${username}" \
+        -e COMPOSE_PROJECT_NAME="openrig-${username}" \
         -e AUTHORIZED_SSH_KEY="$ssh_key" \
         -p "${port}:22" \
         -v "${user_ws}:/workspace" \
@@ -242,14 +270,51 @@ cmd_user_action() {
     local cname="openrig-user-${username}"
     case "$act" in
         stop)
+            local pid_file="${SERVER_DIR}/sockets/${username}.pid"
+            if [ -f "$pid_file" ]; then
+                kill -9 "$(cat "$pid_file" 2>/dev/null)" 2>/dev/null || true
+                rm -f "$pid_file" "${SERVER_DIR}/sockets/${username}.sock"
+            fi
             docker stop "$cname" >/dev/null
             echo -e "${YELLOW}⏸️  Workstation for '${username}' paused/stopped.${RESET}"
             ;;
         start)
+            if [ -S "/var/run/docker.sock" ]; then
+                ensure_docker_proxy "$username" "${SERVER_DIR}/sockets/${username}.sock"
+            fi
             docker start "$cname" >/dev/null
             echo -e "${GREEN}▶️  Workstation for '${username}' started.${RESET}"
             ;;
+        recreate|reload)
+            local entry
+            entry=$(grep -E "^${username}:" "$USERS_DB" | tail -n 1 || true)
+            local port="2202" role="fullstack" ram="4g" cpus="2"
+            if [ -n "$entry" ]; then
+                port=$(echo "$entry" | cut -d: -f2)
+                role=$(echo "$entry" | cut -d: -f3)
+                ram=$(echo "$entry" | cut -d: -f4)
+                cpus=$(echo "$entry" | cut -d: -f5)
+            fi
+            local existing_keys=""
+            if docker inspect "$cname" >/dev/null 2>&1; then
+                existing_keys=$(docker exec "$cname" cat /etc/openrig/authorized_keys 2>/dev/null || true)
+            fi
+            echo -e "${CYAN}🔄 Recreating workstation for '${username}' with Sibling Containers Docker socket...${RESET}"
+            docker rm -f "$cname" >/dev/null 2>&1 || true
+            cmd_user_create "$username" --role "$role" --ram "$ram" --cpus "$cpus" --port "$port" --ssh-key "$existing_keys"
+            echo -e "${GREEN}✔ Workstation '${cname}' successfully recreated with Docker socket active.${RESET}"
+            ;;
         remove|delete)
+            local pid_file="${SERVER_DIR}/sockets/${username}.pid"
+            if [ -f "$pid_file" ]; then
+                kill -9 "$(cat "$pid_file" 2>/dev/null)" 2>/dev/null || true
+                rm -f "$pid_file" "${SERVER_DIR}/sockets/${username}.sock"
+            fi
+            if [ -S "/var/run/docker.sock" ]; then
+                local siblings
+                siblings=$(docker ps -aq --filter "name=^openrig-${username}-" 2>/dev/null || true)
+                [ -n "$siblings" ] && docker rm -f $siblings >/dev/null 2>&1 || true
+            fi
             docker rm -f "$cname" >/dev/null 2>&1 || true
             docker network rm "openrig-net-${username}" >/dev/null 2>&1 || true
             sed -i.bak "/^${username}:/d" "$USERS_DB" 2>/dev/null || true
@@ -887,8 +952,8 @@ case "$ACTION" in
         case "$SUB" in
             create|add)    cmd_user_create "$@" ;;
             list|ls)       cmd_user_list ;;
-            stop|start|remove|delete) cmd_user_action "$SUB" "$@" ;;
-            *) echo "Usage: rig-server user [create|list|stop|start|remove]" ;;
+            stop|start|remove|delete|recreate|reload) cmd_user_action "$SUB" "$@" ;;
+            *) echo "Usage: rig-server user [create|list|stop|start|recreate|remove]" ;;
         esac
         ;;
     status|list|ps)       cmd_user_list ;;

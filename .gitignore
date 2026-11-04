@@ -8,6 +8,8 @@ config/invites.json
 config/*.json
 config/*
 !config/.gitkeep
+sockets/*
+!sockets/.gitkeep
 .users.db
 .invites.json
 __pycache__/
