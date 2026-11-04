@@ -14,9 +14,14 @@ Write-Host "🩺 OpenRig-Server Windows Auto-Repair Utility" -ForegroundColor Gr
 Write-Host "==========================================================================" -ForegroundColor Cyan
 
 # ------------------------------------------------------------------------------
-# 1. FIX CRLF -> LF LINE ENDINGS
+# 1. FIX CRLF -> LF LINE ENDINGS & MSYS PATH CONVERSION
 # ------------------------------------------------------------------------------
-Write-Host "`n[1/4] 🧹 Normalizing Unix Line Endings (CRLF -> LF)..." -ForegroundColor White
+Write-Host "`n[1/4] 🧹 Normalizing Line Endings (CRLF -> LF) & Git Bash Settings..." -ForegroundColor White
+
+[Environment]::SetEnvironmentVariable("MSYS_NO_PATHCONV", "1", "User")
+[Environment]::SetEnvironmentVariable("MSYS2_ARG_CONV_EXCL", "*", "User")
+$env:MSYS_NO_PATHCONV = "1"
+$env:MSYS2_ARG_CONV_EXCL = "*"
 
 function Repair-DirLineEndings([string]$dir) {
     if (-not (Test-Path $dir)) { return 0 }
@@ -104,6 +109,8 @@ param(
     [Parameter(ValueFromRemainingArguments=$true)]
     [string[]]$ArgsRest
 )
+$env:MSYS_NO_PATHCONV = "1"
+$env:MSYS2_ARG_CONV_EXCL = "*"
 $PSScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $winScript = Join-Path $PSScriptDir "rig-server"
 

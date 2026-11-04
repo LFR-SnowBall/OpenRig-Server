@@ -11,6 +11,10 @@ param(
     [string[]]$ArgsRest
 )
 
+# Prevent Git Bash from converting Unix paths (/dev/net/tun) into Windows paths (C:\Program Files\Git\...)
+$env:MSYS_NO_PATHCONV = "1"
+$env:MSYS2_ARG_CONV_EXCL = "*"
+
 $PSScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $winScript = Join-Path $PSScriptDir "rig-server"
 

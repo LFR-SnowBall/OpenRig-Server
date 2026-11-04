@@ -5,6 +5,10 @@
 # ==============================================================================
 set -euo pipefail
 
+# Disable Git Bash path mangling on Windows (prevents /dev/net/tun -> C:\Program Files\Git...)
+export MSYS_NO_PATHCONV=1
+export MSYS2_ARG_CONV_EXCL="*"
+
 SOURCE="${BASH_SOURCE[0]}"
 while [ -L "$SOURCE" ]; do
     DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
@@ -132,6 +136,16 @@ cmd_user_create() {
 
     docker rm -f "$container_name" >/dev/null 2>&1 || true
 
+    local tun_opt=()
+    if [ -e "/dev/net/tun" ]; then
+        tun_opt=(--device /dev/net/tun:/dev/net/tun)
+    fi
+
+    if ! docker image inspect "openrig:${role}" >/dev/null 2>&1; then
+        echo -e "${CYAN}🐳 Pre-warmed image 'openrig:${role}' not found locally. Pulling from registry...${RESET}"
+        docker pull "ghcr.io/lfr-snowball/openrig:${role}" && docker tag "ghcr.io/lfr-snowball/openrig:${role}" "openrig:${role}" || true
+    fi
+
     docker run -d \
         --name "$container_name" \
         --hostname "rig-${username}" \
@@ -143,7 +157,7 @@ cmd_user_create() {
         --cpus "$cpus" \
         --pids-limit 512 \
         --cap-add NET_ADMIN \
-        --device /dev/net/tun:/dev/net/tun \
+        ${tun_opt[@]+"${tun_opt[@]}"} \
         -e OPENRIG_SSH_SERVER=true \
         -e OPENRIG_SERVER_TENANT=true \
         -e AUTHORIZED_SSH_KEY="$ssh_key" \
