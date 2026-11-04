@@ -1198,6 +1198,10 @@ case "$ACTION" in
         ;;
     enter|shell)          cmd_user_action "enter" "$@" ;;
     attach|watch)         cmd_user_action "attach" "$@" ;;
+    recreate|reload)      cmd_user_action "recreate" "$@" ;;
+    restart)              cmd_user_action "stop" "$@" && cmd_user_action "start" "$@" ;;
+    stop)                 cmd_user_action "stop" "$@" ;;
+    start)                cmd_user_action "start" "$@" ;;
     audit|logs)           cmd_audit "$@" ;;
     status|list|ps)       cmd_user_list ;;
     create|new)           cmd_create_wizard "$@" ;;
@@ -1228,6 +1232,7 @@ case "$ACTION" in
         echo "  rig-server version               -> Print current OpenRig-Server version and commit hash"
         echo "  rig-server enter <user>          -> Open an independent interactive shell in user's workstation"
         echo "  rig-server attach <user>         -> Attach live to user's tmux session (real-time pair programming)"
+        echo "  rig-server recreate <user>       -> Recreate user container with updated Docker socket & features"
         echo "  rig-server audit [limit]         -> Inspect immutable JSONL audit trail of administrator actions"
         echo "  rig-server user [stop|start|remove] <user>"
         echo ""
