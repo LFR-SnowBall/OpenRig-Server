@@ -21,12 +21,57 @@ USERS_DB="${SERVER_DIR}/config/users.db"
 mkdir -p "$WORKSPACES_DIR" "$BACKUPS_DIR" "${SERVER_DIR}/config"
 touch "$USERS_DB"
 
+SERVER_VERSION="1.1.0"
+[ -f "${SERVER_DIR}/VERSION" ] && SERVER_VERSION=$(cat "${SERVER_DIR}/VERSION" | tr -d '\r\n')
+
 CYAN="\033[96m"
 GREEN="\033[92m"
 YELLOW="\033[93m"
 RED="\033[91m"
 BOLD="\033[1m"
 RESET="\033[0m"
+
+cmd_version() {
+    local git_hash="release"
+    if [ -d "${SERVER_DIR}/.git" ] && command -v git >/dev/null 2>&1; then
+        git_hash=$(git -C "$SERVER_DIR" rev-parse --short HEAD 2>/dev/null || echo "release")
+    fi
+    echo -e "${CYAN}${BOLD}🏢 OpenRig-Server v${SERVER_VERSION}${RESET} (${git_hash})"
+}
+
+cmd_update() {
+    echo -e "${CYAN}🔄 Checking for OpenRig-Server updates...${RESET}"
+    if [ ! -d "${SERVER_DIR}/.git" ]; then
+        echo -e "${YELLOW}OpenRig-Server was not installed via Git. Updating archive from GitHub...${RESET}"
+        local tmp_archive="/tmp/openrig-server-update.tar.gz"
+        curl -fsSL -o "$tmp_archive" "https://github.com/LFR-SnowBall/OpenRig-Server/archive/refs/heads/main.tar.gz"
+        tar -xzf "$tmp_archive" -C "$SERVER_DIR" --strip-components=1
+        rm -f "$tmp_archive"
+        [ -f "${SERVER_DIR}/VERSION" ] && SERVER_VERSION=$(cat "${SERVER_DIR}/VERSION" | tr -d '\r\n')
+        echo -e "${GREEN}✔ OpenRig-Server updated successfully to v${SERVER_VERSION}!${RESET}"
+    else
+        git -C "$SERVER_DIR" fetch --tags origin 2>/dev/null || true
+        local local_hash remote_hash
+        local_hash=$(git -C "$SERVER_DIR" rev-parse HEAD 2>/dev/null || echo "1")
+        remote_hash=$(git -C "$SERVER_DIR" rev-parse origin/main 2>/dev/null || echo "2")
+        if [ "$local_hash" = "$remote_hash" ]; then
+            echo -e "${GREEN}✔ OpenRig-Server is already up to date (v${SERVER_VERSION}).${RESET}"
+        else
+            echo -e "📥 Pulling latest improvements from GitHub..."
+            git -C "$SERVER_DIR" pull --ff-only origin main
+            [ -f "${SERVER_DIR}/VERSION" ] && SERVER_VERSION=$(cat "${SERVER_DIR}/VERSION" | tr -d '\r\n')
+            echo -e "${GREEN}✔ OpenRig-Server updated successfully to v${SERVER_VERSION}!${RESET}"
+        fi
+    fi
+
+    # Ensure CLI symlink is active
+    if [ -w "/usr/local/bin" ] || sudo -n true 2>/dev/null; then
+        sudo ln -sf "${SERVER_DIR}/rig-server" "/usr/local/bin/rig-server" 2>/dev/null || ln -sf "${SERVER_DIR}/rig-server" "/usr/local/bin/rig-server"
+    else
+        mkdir -p "${HOME}/.local/bin"
+        ln -sf "${SERVER_DIR}/rig-server" "${HOME}/.local/bin/rig-server"
+    fi
+}
 
 banner() {
     echo -e "${CYAN}${BOLD}"
@@ -808,6 +853,8 @@ case "$ACTION" in
     invite|inv)           cmd_invite "$@" ;;
     backup)               cmd_backup "$@" ;;
     migrate)              cmd_migrate "$@" ;;
+    update|upgrade)       cmd_update "$@" ;;
+    version|-v|--version) cmd_version ;;
     help|-h|--help|*)
         banner
         echo -e "${GREEN}${BOLD}📍 Context: SERVER ADMINISTRATOR CLI (OpenRig-Server Multi-Tenant Hub)${RESET}\n"
@@ -821,6 +868,8 @@ case "$ACTION" in
         echo "  rig-server invite create --user <user> [--role fullstack] [--ram 4g] [--cpus 2]"
         echo "  rig-server invite list           -> List invitations and bound Hardware IDs per user"
         echo "  rig-server status                -> Dashboard of users, ports, quotas, and live consumption"
+        echo "  rig-server update                -> Update OpenRig-Server to latest version from GitHub"
+        echo "  rig-server version               -> Print current OpenRig-Server version and commit hash"
         echo "  rig-server user [stop|start|remove] <user>"
         echo ""
         echo -e "${BOLD}Encrypted Server Backup & Migration (AES-256 Military Grade):${RESET}"

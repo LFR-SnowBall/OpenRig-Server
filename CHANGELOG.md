@@ -10,6 +10,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [1.1.0] - 2026-11-03
 
 ### Added
+- **Self-Updating Engine & Semantic Versioning (`rig-server update / version`):**
+  - Instant OTA updates directly from GitHub with zero server downtime.
+  - Command `rig-server version` to inspect active release version and commit hash.
 - **Military-Grade Encrypted Server Backup (`rig-server backup export / restore`):**
   - Encrypts single tenant workspaces or entire server states (all tenants, source code, `config/users.db`, quotas, and Gatekeeper policies) using **AES-256-CBC with PBKDF2** (100,000 iterations).
   - Produces portable, password-protected `.rigpack` bundles.
