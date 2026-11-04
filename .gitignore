@@ -5,6 +5,9 @@ backups/*
 !backups/.gitkeep
 config/users.db
 config/invites.json
+config/*.json
+config/*
+!config/.gitkeep
 .users.db
 .invites.json
 __pycache__/
