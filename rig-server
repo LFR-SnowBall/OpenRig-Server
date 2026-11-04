@@ -22,8 +22,105 @@ export PATH="${HOME}/.orbstack/bin:/Applications/OrbStack.app/Contents/MacOS/xbi
 WORKSPACES_DIR="${SERVER_DIR}/workspaces"
 BACKUPS_DIR="${SERVER_DIR}/backups"
 USERS_DB="${SERVER_DIR}/config/users.db"
-mkdir -p "$WORKSPACES_DIR" "$BACKUPS_DIR" "${SERVER_DIR}/config"
-touch "$USERS_DB"
+LOGS_DIR="${SERVER_DIR}/logs"
+AUDIT_LOG="${LOGS_DIR}/audit.log"
+mkdir -p "$WORKSPACES_DIR" "$BACKUPS_DIR" "${SERVER_DIR}/config" "$LOGS_DIR"
+touch "$USERS_DB" "$AUDIT_LOG"
+
+get_admin_identity() {
+    local u
+    u="$(whoami 2>/dev/null || echo "${USER:-unknown}")"
+    if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "$u" ]; then
+        u="${u} (via sudo by ${SUDO_USER})"
+    fi
+    if [ -n "${SSH_CLIENT:-}" ]; then
+        local ip
+        ip=$(echo "$SSH_CLIENT" | awk '{print $1}')
+        u="${u}@${ip}"
+    fi
+    echo "$u"
+}
+
+log_audit_event() {
+    local event="$1"
+    local mode="$2"
+    local target="$3"
+    local details="${4:-}"
+    local admin_u
+    admin_u="$(get_admin_identity)"
+    local srv_h
+    srv_h="$(hostname 2>/dev/null || echo "openrig-server")"
+    local action_id
+    action_id="aud_$(head -c 6 /dev/urandom 2>/dev/null | xxd -p 2>/dev/null || date +%s%N)"
+    local ts
+    ts="$(date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || date +"%Y-%m-%dT%H:%M:%SZ")"
+
+    python3 - "$AUDIT_LOG" "$ts" "$action_id" "$event" "$mode" "$target" "$admin_u" "$srv_h" "$details" << 'PY' 2>/dev/null || true
+import json, sys
+log_path, ts, aid, ev, md, tgt, adm, host, det = sys.argv[1:10]
+entry = {
+    "timestamp": ts,
+    "action_id": aid,
+    "event": ev,
+    "mode": md,
+    "target_user": tgt,
+    "admin_user": adm,
+    "server_host": host,
+    "details": det
+}
+with open(log_path, "a", encoding="utf-8") as f:
+    f.write(json.dumps(entry) + "\n")
+PY
+    echo "$action_id"
+}
+
+notify_user_container() {
+    local cname="$1"
+    local mode="$2"
+    local admin_u="$3"
+    local srv_h="$4"
+    local ts
+    ts="$(date -u +"%Y-%m-%d %H:%M:%S UTC")"
+
+    if ! docker inspect "$cname" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    local banner=""
+    local tmux_msg=""
+
+    if [ "$mode" = "LIVE_PAIRING_ATTACH" ]; then
+        banner="🚨 [OPENRIG SECURITY ALERT]
+ADMINISTRATOR ATTACHED TO YOUR SESSION (LIVE PAIR-PROGRAMMING)
+Time:       $ts
+Admin User: $admin_u
+Host:       $srv_h
+Mode:       LIVE_PAIRING (Sharing your active terminal/tmux screen in real time)"
+        tmux_msg="🚨 [SECURITY ALERT] Admin '${admin_u}' attached to your session in LIVE PAIRING mode ($ts)"
+    elif [ "$mode" = "INDEPENDENT_SHELL" ]; then
+        banner="⚠️ [OPENRIG AUDIT NOTICE]
+ADMINISTRATOR OPENED AN INDEPENDENT TERMINAL IN YOUR WORKSTATION
+Time:       $ts
+Admin User: $admin_u
+Host:       $srv_h
+Mode:       INDEPENDENT_SHELL (Parallel background session in /workspace)"
+        tmux_msg="⚠️ [SECURITY NOTICE] Admin '${admin_u}' opened an independent shell in your workstation ($ts)"
+    elif [ "$mode" = "DISCONNECTED" ]; then
+        banner="ℹ️ [OPENRIG AUDIT]
+Administrator '${admin_u}' disconnected from your workstation.
+Time:       $ts"
+        tmux_msg="ℹ️ [SECURITY] Admin '${admin_u}' disconnected ($ts)"
+    fi
+
+    # 1. Broadcast via wall to all open pseudo-terminals of the user
+    docker exec "$cname" bash -c "echo -e \"$banner\" | wall 2>/dev/null || true" 2>/dev/null || true
+
+    # 2. Display banner in tmux status line if tmux is active
+    docker exec "$cname" tmux display-message -d 10000 "$tmux_msg" 2>/dev/null || true
+
+    # 3. Append to user's internal audit log in /workspace/.openrig-audit.log
+    docker exec "$cname" bash -c "echo '[$ts] ADMIN_ACCESS: mode=$mode admin=$admin_u host=$srv_h' >> /workspace/.openrig-audit.log 2>/dev/null || true" 2>/dev/null || true
+}
 
 get_server_ip() {
     local ip=""
@@ -159,6 +256,10 @@ cmd_user_create() {
     local port
     port=$(next_free_port)
     local ssh_key=""
+    local enable_web_ide="true"
+    local allow_mobile="false"
+    local enable_share="true"
+    local allow_admin_attach="true"
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -167,6 +268,13 @@ cmd_user_create() {
             --cpus)    cpus="$2"; shift 2 ;;
             --port)    port="$2"; shift 2 ;;
             --ssh-key) ssh_key="$2"; shift 2 ;;
+            --no-web-ide|--disable-web-ide) enable_web_ide="false"; shift ;;
+            --web-ide) enable_web_ide="$2"; shift 2 ;;
+            --allow-mobile) allow_mobile="true"; shift ;;
+            --no-mobile)    allow_mobile="false"; shift ;;
+            --no-share)     enable_share="false"; shift ;;
+            --share)        enable_share="$2"; shift 2 ;;
+            --no-admin-attach) allow_admin_attach="false"; shift ;;
             *) shift ;;
         esac
     done
@@ -224,6 +332,10 @@ cmd_user_create() {
         -e OPENRIG_SSH_SERVER=true \
         -e OPENRIG_SERVER_TENANT=true \
         -e OPENRIG_USER="${username}" \
+        -e OPENRIG_ENABLE_WEB_IDE="${enable_web_ide}" \
+        -e OPENRIG_ALLOW_MOBILE="${allow_mobile}" \
+        -e OPENRIG_ENABLE_SHARE="${enable_share}" \
+        -e OPENRIG_ALLOW_ADMIN_ATTACH="${allow_admin_attach}" \
         -e COMPOSE_PROJECT_NAME="openrig-${username}" \
         -e AUTHORIZED_SSH_KEY="$ssh_key" \
         -p "${port}:22" \
@@ -268,8 +380,49 @@ cmd_user_action() {
     local act="$1"
     local username="${2:?Missing username}"
     local cname="openrig-user-${username}"
+    local admin_u
+    admin_u="$(get_admin_identity)"
+    local srv_h
+    srv_h="$(hostname 2>/dev/null || echo "openrig-server")"
+
     case "$act" in
+        enter|shell)
+            local aid
+            aid=$(log_audit_event "ADMIN_SESSION_ACCESS" "INDEPENDENT_SHELL" "$username" "Interactive terminal opened by admin")
+            echo -e "${YELLOW}🔒 [OpenRig Audit] Access logged (ID: ${BOLD}${aid}${RESET}${YELLOW}).${RESET}"
+            echo -e "${CYAN}📢 Notifying user '${username}' of administrative shell access...${RESET}"
+            notify_user_container "$cname" "INDEPENDENT_SHELL" "$admin_u" "$srv_h"
+            
+            docker exec -it -u rig -w /workspace "$cname" zsh -l || true
+            
+            log_audit_event "ADMIN_SESSION_EXIT" "INDEPENDENT_SHELL" "$username" "Interactive terminal closed (ref: ${aid})"
+            notify_user_container "$cname" "DISCONNECTED" "$admin_u" "$srv_h"
+            ;;
+        attach|watch)
+            local allow_att
+            allow_att=$(docker inspect "$cname" --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null | grep -E '^OPENRIG_ALLOW_ADMIN_ATTACH=' | cut -d= -f2 || echo "true")
+            if [ "$allow_att" = "false" ]; then
+                echo -e "${RED}🚫 Live pair-programming attach is disabled for user '${username}' by workstation security policy (OPENRIG_ALLOW_ADMIN_ATTACH=false).${RESET}"
+                return 1
+            fi
+            local aid
+            aid=$(log_audit_event "ADMIN_SESSION_ACCESS" "LIVE_PAIRING_ATTACH" "$username" "Admin attached to live tmux session")
+            echo -e "${YELLOW}🔒 [OpenRig Audit] Access logged (ID: ${BOLD}${aid}${RESET}${YELLOW}).${RESET}"
+            echo -e "${CYAN}📢 Notifying user '${username}' of live pair-programming attach...${RESET}"
+            notify_user_container "$cname" "LIVE_PAIRING_ATTACH" "$admin_u" "$srv_h"
+            
+            if docker exec "$cname" tmux has-session -t openrig >/dev/null 2>&1; then
+                docker exec -it -u rig "$cname" tmux attach-session -t openrig || true
+            else
+                echo -e "${YELLOW}⚠️  No active 'openrig' tmux session found in '${cname}'. Opening an independent shell instead...${RESET}"
+                docker exec -it -u rig -w /workspace "$cname" zsh -l || true
+            fi
+            
+            log_audit_event "ADMIN_SESSION_EXIT" "LIVE_PAIRING_ATTACH" "$username" "Admin detached from session (ref: ${aid})"
+            notify_user_container "$cname" "DISCONNECTED" "$admin_u" "$srv_h"
+            ;;
         stop)
+            log_audit_event "ADMIN_WORKSTATION_CONTROL" "STOP" "$username" "Workstation container stopped by admin"
             local pid_file="${SERVER_DIR}/sockets/${username}.pid"
             if [ -f "$pid_file" ]; then
                 kill -9 "$(cat "$pid_file" 2>/dev/null)" 2>/dev/null || true
@@ -279,6 +432,7 @@ cmd_user_action() {
             echo -e "${YELLOW}⏸️  Workstation for '${username}' paused/stopped.${RESET}"
             ;;
         start)
+            log_audit_event "ADMIN_WORKSTATION_CONTROL" "START" "$username" "Workstation container started by admin"
             if [ -S "/var/run/docker.sock" ]; then
                 ensure_docker_proxy "$username" "${SERVER_DIR}/sockets/${username}.sock"
             fi
@@ -286,6 +440,7 @@ cmd_user_action() {
             echo -e "${GREEN}▶️  Workstation for '${username}' started.${RESET}"
             ;;
         recreate|reload)
+            log_audit_event "ADMIN_WORKSTATION_CONTROL" "RECREATE" "$username" "Workstation container recreated by admin"
             local entry
             entry=$(grep -E "^${username}:" "$USERS_DB" | tail -n 1 || true)
             local port="2202" role="fullstack" ram="4g" cpus="2"
@@ -304,7 +459,36 @@ cmd_user_action() {
             cmd_user_create "$username" --role "$role" --ram "$ram" --cpus "$cpus" --port "$port" --ssh-key "$existing_keys"
             echo -e "${GREEN}✔ Workstation '${cname}' successfully recreated with Docker socket active.${RESET}"
             ;;
+        sessions|history|log)
+            local ulog="${WORKSPACES_DIR}/${username}/.openrig-sessions.log"
+            banner
+            echo -e "${BOLD}📱 Workstation Device & Session Audit Trail for '${username}':${RESET}\n"
+            if [ ! -f "$ulog" ] || [ ! -s "$ulog" ]; then
+                echo "  (No session connection records found for user '${username}')"
+                return 0
+            fi
+            python3 - "$ulog" 30 << 'PY'
+import json, sys
+p, limit = sys.argv[1], int(sys.argv[2])
+lines = [l.strip() for l in open(p, encoding='utf-8') if l.strip()]
+print(f"  {'TIMESTAMP':<20} {'EVENT':<12} {'DEVICE':<30} {'IP ADDRESS':<16} {'RESOLUTION':<12}")
+print("  " + "-" * 92)
+for line in lines[-limit:]:
+    try:
+        d = json.loads(line)
+        ts = d.get('timestamp', '')[:19].replace('T', ' ')
+        ev = d.get('event', '-')
+        dev = d.get('device', '-')
+        ip = d.get('client_ip', '-')
+        res = d.get('resolution', '-')
+        print(f"  {ts:<20} {ev:<12} {dev:<30} {ip:<16} {res:<12}")
+    except Exception:
+        continue
+print("")
+PY
+            ;;
         remove|delete)
+            log_audit_event "ADMIN_WORKSTATION_CONTROL" "REMOVE" "$username" "Workstation container removed by admin"
             local pid_file="${SERVER_DIR}/sockets/${username}.pid"
             if [ -f "$pid_file" ]; then
                 kill -9 "$(cat "$pid_file" 2>/dev/null)" 2>/dev/null || true
@@ -942,6 +1126,62 @@ PY
     esac
 }
 
+cmd_audit() {
+    local limit="25"
+    local filter_user=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --user|-u) filter_user="$2"; shift 2 ;;
+            *) [[ "$1" =~ ^[0-9]+$ ]] && limit="$1"; shift ;;
+        esac
+    done
+
+    banner
+    local title="🛡️  OpenRig-Server Immutable Admin Audit Trail (Last ${limit} Events"
+    [ -n "$filter_user" ] && title="${title} for '${filter_user}'"
+    echo -e "${BOLD}${title}):${RESET}\n"
+
+    if [ ! -f "$AUDIT_LOG" ] || [ ! -s "$AUDIT_LOG" ]; then
+        echo "  (No audit events recorded yet in logs/audit.log)"
+        return 0
+    fi
+    python3 - "$AUDIT_LOG" "$limit" "$filter_user" << 'PY'
+import json, sys
+p, limit_str, filter_user = sys.argv[1], sys.argv[2], sys.argv[3]
+limit = int(limit_str)
+lines = [l.strip() for l in open(p, encoding='utf-8') if l.strip()]
+if not lines:
+    print("  (Audit log is empty)")
+    sys.exit(0)
+
+filtered = []
+for line in lines:
+    try:
+        d = json.loads(line)
+        if filter_user and d.get('target_user', '') != filter_user:
+            continue
+        filtered.append(d)
+    except Exception:
+        continue
+
+if not filtered:
+    print(f"  (No audit records found matching user '{filter_user}')")
+    sys.exit(0)
+
+print(f"  {'TIMESTAMP':<20} {'EVENT':<24} {'TARGET':<12} {'ADMIN':<18} {'MODE':<20} {'DETAILS'}")
+print("  " + "-" * 115)
+for d in filtered[-limit:]:
+    ts = d.get('timestamp', '')[:19].replace('T', ' ')
+    ev = d.get('event', '-')
+    tgt = d.get('target_user', '-')
+    adm = d.get('admin_user', '-')
+    md = d.get('mode', '-')
+    det = d.get('details', '')
+    print(f"  {ts:<20} {ev:<24} {tgt:<12} {adm:<18} {md:<20} {det}")
+print("")
+PY
+}
+
 ACTION="${1:-help}"
 shift || true
 
@@ -952,10 +1192,13 @@ case "$ACTION" in
         case "$SUB" in
             create|add)    cmd_user_create "$@" ;;
             list|ls)       cmd_user_list ;;
-            stop|start|remove|delete|recreate|reload) cmd_user_action "$SUB" "$@" ;;
-            *) echo "Usage: rig-server user [create|list|stop|start|recreate|remove]" ;;
+            stop|start|remove|delete|recreate|reload|enter|shell|attach|watch|sessions|history|log) cmd_user_action "$SUB" "$@" ;;
+            *) echo "Usage: rig-server user [create|list|stop|start|recreate|enter|attach|sessions|remove]" ;;
         esac
         ;;
+    enter|shell)          cmd_user_action "enter" "$@" ;;
+    attach|watch)         cmd_user_action "attach" "$@" ;;
+    audit|logs)           cmd_audit "$@" ;;
     status|list|ps)       cmd_user_list ;;
     create|new)           cmd_create_wizard "$@" ;;
     scale|resize)         cmd_scale "$@" ;;
@@ -983,6 +1226,9 @@ case "$ACTION" in
         echo "  rig-server status                -> Dashboard of users, ports, quotas, and live consumption"
         echo "  rig-server update                -> Update OpenRig-Server to latest version from GitHub"
         echo "  rig-server version               -> Print current OpenRig-Server version and commit hash"
+        echo "  rig-server enter <user>          -> Open an independent interactive shell in user's workstation"
+        echo "  rig-server attach <user>         -> Attach live to user's tmux session (real-time pair programming)"
+        echo "  rig-server audit [limit]         -> Inspect immutable JSONL audit trail of administrator actions"
         echo "  rig-server user [stop|start|remove] <user>"
         echo ""
         echo -e "${BOLD}Encrypted Server Backup & Migration (AES-256 Military Grade):${RESET}"

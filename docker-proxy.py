@@ -23,7 +23,20 @@ import sys
 import threading
 import time
 
-DOCKER_SOCK = "/var/run/docker.sock"
+def find_docker_socket() -> str:
+    candidates = [
+        "/var/run/docker.sock",
+        os.path.expanduser("~/.orbstack/run/docker.sock"),
+        os.path.expanduser("~/.docker/run/docker.sock"),
+        "/var/run/docker/docker.sock"
+    ]
+    for c in candidates:
+        if os.path.exists(c):
+            return c
+    return "/var/run/docker.sock"
+
+
+DOCKER_SOCK = os.environ.get("DOCKER_HOST_SOCK") or find_docker_socket()
 BUFFER_SIZE = 65536
 
 # Cache of verified container IDs belonging to users
@@ -161,14 +174,40 @@ def handle_client(client_sock, username: str):
                     labels = payload.setdefault("Labels", {})
                     labels["openrig.owner"] = username
 
-                    # Block host root mounts (anti-escape)
+                    # Enforce Strict Anti-Escape Security Policies
                     host_config = payload.setdefault("HostConfig", {})
+
+                    # 1. Enforce Non-Privileged mode & strip dangerous capabilities
+                    host_config["Privileged"] = False
+                    cap_add = host_config.get("CapAdd") or []
+                    dangerous_caps = {"ALL", "SYS_ADMIN", "SYS_PTRACE", "SYS_RAWIO", "MKNOD"}
+                    host_config["CapAdd"] = [c for c in cap_add if c.upper() not in dangerous_caps]
+
+                    # 2. Block Host Namespaces (prevents inspecting host processes or network)
+                    if host_config.get("NetworkMode", "").lower() == "host":
+                        host_config["NetworkMode"] = f"openrig-net-{username}"
+                    if host_config.get("PidMode", "").lower() == "host":
+                        host_config["PidMode"] = ""
+                    if host_config.get("IpcMode", "").lower() == "host":
+                        host_config["IpcMode"] = "private"
+
+                    # 3. Strip direct Host Devices (prevents raw disk block access)
+                    host_config["Devices"] = []
+
+                    # 4. Block host root mounts & forbidden directories
                     binds = host_config.get("Binds", [])
                     safe_binds = []
+                    forbidden_prefixes = (
+                        "/etc", "/var", "/root", "/bin", "/sbin", "/usr",
+                        "/proc", "/sys", "/dev", "/boot", "/mnt", "c:", "d:",
+                    )
                     for b in binds:
                         parts_b = b.split(":")
-                        src = parts_b[0]
-                        # Only allow relative volume names or mounts within /workspace
+                        src = parts_b[0].strip()
+                        src_lower = src.lower()
+                        if src == "/" or any(src_lower.startswith(fp) for fp in forbidden_prefixes):
+                            if not src.startswith("/workspace"):
+                                continue  # Strip host system root mounts
                         if src.startswith("/") and not src.startswith("/workspace"):
                             continue  # Strip forbidden host mounts
                         safe_binds.append(b)
