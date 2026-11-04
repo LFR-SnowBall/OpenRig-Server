@@ -108,11 +108,21 @@ On the **OpenRig-Server Host**, the Administrator reviews and approves the reque
 ./rig-server status
 ```
 
-### 4. Automated Workspace Backups (`rig-server backup`)
+### 4. Encrypted Server Backup & Migration (`rig-server backup` / `rig-server migrate`)
+Export, restore, or migrate tenants and entire servers with **AES-256-CBC PBKDF2 military-grade encryption**:
 ```bash
-# Backup a specific developer's workspace or all tenants to ./backups/*.tar.gz:
-./rig-server backup luis
-./rig-server backup all
+# 1. Export an entire server (all tenants, source code, configs, and users.db) encrypted:
+./rig-server backup export --all --out /var/backups/server-full.rigpack
+# -> Prompts for AES-256 master password (or pass --key-file / --pass)
+
+# 2. Export a single developer's workspace and configuration:
+./rig-server backup export luis --out /var/backups/luis.rigpack
+
+# 3. Restore on a new bare-metal server, cloud VM, or desktop rig:
+./rig-server backup restore /var/backups/server-full.rigpack
+
+# 4. Live Server-to-Server network migration stream:
+./rig-server migrate push 192.168.1.200:22 --all
 ```
 
 ### 5. Multi-Tenant Split-Brain Isolation & Enterprise DLP Governance (`rig-server dlp`)

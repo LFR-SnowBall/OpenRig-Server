@@ -165,13 +165,216 @@ cmd_user_action() {
 }
 
 cmd_backup() {
-    local username="${1:?Usage: rig-server backup <username>}"
-    local ts
-    ts=$(date +%Y%m%d_%H%M%S)
-    local out="${BACKUPS_DIR}/${username}_workspace_${ts}.tar.gz"
-    echo -e "${CYAN}📦 Backing up workspace of '${username}' to ${out}...${RESET}"
-    tar -czf "$out" -C "$WORKSPACES_DIR" "$username"
-    echo -e "${GREEN}✅ Backup completed: ${out}${RESET}"
+    local sub="${1:-help}"
+    shift || true
+
+    case "$sub" in
+        export|create)
+            local target_user="--all"
+            local out_file=""
+            local key_file=""
+            local pass_val=""
+            local full_backup=false
+
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    --all) target_user="--all"; shift ;;
+                    --key-file) key_file="$2"; shift 2 ;;
+                    --pass) pass_val="$2"; shift 2 ;;
+                    --full) full_backup=true; shift ;;
+                    *) [ -z "$out_file" ] && out_file="$1" || target_user="$1"; shift ;;
+                esac
+            done
+
+            local ts
+            ts=$(date +%Y%m%d_%H%M%S)
+            if [ -z "$out_file" ]; then
+                if [ "$target_user" = "--all" ]; then
+                    out_file="${BACKUPS_DIR}/openrig-server-full-${ts}.rigpack"
+                else
+                    out_file="${BACKUPS_DIR}/${target_user}-workspace-${ts}.rigpack"
+                fi
+            fi
+
+            if [ -n "$key_file" ] && [ -f "$key_file" ]; then
+                pass_val=$(cat "$key_file")
+            elif [ -z "$pass_val" ]; then
+                echo -e "${CYAN}🔐 Setting up AES-256 Military Grade Encryption for Server Backup:${RESET}"
+                read -s -p "Enter server backup encryption password: " pass_val
+                echo ""
+                read -s -p "Confirm encryption password: " pass_confirm
+                echo ""
+                if [ "$pass_val" != "$pass_confirm" ] || [ -z "$pass_val" ]; then
+                    echo -e "${RED}❌ Passwords do not match or are empty. Backup aborted.${RESET}"
+                    return 1
+                fi
+            fi
+
+            echo -e "${CYAN}📦 Packaging encrypted server bundle (${target_user}) -> ${BOLD}${out_file}${RESET}..."
+            local tar_excludes=(
+                --exclude='*/node_modules'
+                --exclude='*/target'
+                --exclude='*/.gradle'
+                --exclude='*/.cache'
+                --exclude='*/dist'
+                --exclude='*/build'
+                --exclude='*/.venv'
+                --exclude='*/venv'
+                --exclude='*/__pycache__'
+            )
+            [ "$full_backup" = "true" ] && tar_excludes=()
+
+            local staging_dir
+            staging_dir=$(mktemp -d /tmp/rig-server-backup.XXXXXX)
+            mkdir -p "${staging_dir}/payload"
+
+            if [ "$target_user" = "--all" ]; then
+                mkdir -p "${staging_dir}/payload/config" "${staging_dir}/payload/workspaces"
+                [ -d "${SERVER_DIR}/config" ] && cp -R "${SERVER_DIR}/config/." "${staging_dir}/payload/config/" 2>/dev/null || true
+                [ -d "${SERVER_DIR}/workspaces" ] && cp -R "${SERVER_DIR}/workspaces/." "${staging_dir}/payload/workspaces/" 2>/dev/null || true
+            else
+                mkdir -p "${staging_dir}/payload/workspaces/${target_user}"
+                if [ -d "${WORKSPACES_DIR}/${target_user}" ]; then
+                    cp -R "${WORKSPACES_DIR}/${target_user}/." "${staging_dir}/payload/workspaces/${target_user}/" 2>/dev/null || true
+                fi
+                if grep -E "^${target_user}:" "$USERS_DB" > "${staging_dir}/payload/user.db_entry" 2>/dev/null; then
+                    true
+                fi
+            fi
+
+            tar -czf - -C "${staging_dir}/payload" "${tar_excludes[@]}" . | \
+                openssl enc -aes-256-cbc -pbkdf2 -iter 100000 -salt -out "$out_file" -pass "pass:${pass_val}"
+
+            rm -rf "$staging_dir"
+            local size
+            size=$(du -h "$out_file" | awk '{print $1}')
+            echo -e "${GREEN}✅ Encrypted server backup created successfully (${size}): ${BOLD}${out_file}${RESET}"
+            echo -e "   • Cipher: AES-256-CBC with PBKDF2 (100,000 iterations)"
+            echo -e "   • To restore on any server: ${BOLD}rig-server backup restore ${out_file}${RESET}"
+            ;;
+
+        restore|import)
+            local in_file=""
+            local key_file=""
+            local pass_val=""
+
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    --key-file) key_file="$2"; shift 2 ;;
+                    --pass) pass_val="$2"; shift 2 ;;
+                    *) [ -z "$in_file" ] && in_file="$1"; shift ;;
+                esac
+            done
+
+            [ -z "$in_file" ] && { echo -e "${RED}Usage: rig-server backup restore <file.rigpack> [--key-file <path>] [--pass <pass>]${RESET}"; return 1; }
+            [ ! -f "$in_file" ] && { echo -e "${RED}❌ Backup file not found: ${in_file}${RESET}"; return 1; }
+
+            if [ -n "$key_file" ] && [ -f "$key_file" ]; then
+                pass_val=$(cat "$key_file")
+            elif [ -z "$pass_val" ]; then
+                read -s -p "🔐 Enter AES-256 password to decrypt ${in_file}: " pass_val
+                echo ""
+            fi
+
+            echo -e "${CYAN}🔓 Verifying and decrypting server bundle: ${in_file}...${RESET}"
+            local restore_tmp
+            restore_tmp=$(mktemp -d /tmp/rig-server-restore.XXXXXX)
+
+            if ! openssl enc -d -aes-256-cbc -pbkdf2 -iter 100000 -in "$in_file" -pass "pass:${pass_val}" 2>/dev/null | tar -xzf - -C "$restore_tmp" 2>/dev/null; then
+                rm -rf "$restore_tmp"
+                echo -e "${RED}❌ Decryption failed! The encryption password or key file is invalid, or the archive is corrupted.${RESET}"
+                return 1
+            fi
+
+            # Restore configurations and workspaces
+            if [ -d "${restore_tmp}/config" ]; then
+                mkdir -p "${SERVER_DIR}/config"
+                cp -R "${restore_tmp}/config/." "${SERVER_DIR}/config/" 2>/dev/null || true
+                echo -e "  ✔ Restored server configurations and users database"
+            fi
+            if [ -d "${restore_tmp}/workspaces" ]; then
+                mkdir -p "${SERVER_DIR}/workspaces"
+                cp -R "${restore_tmp}/workspaces/." "${SERVER_DIR}/workspaces/" 2>/dev/null || true
+                echo -e "  ✔ Restored tenant workspaces and source code repositories"
+            fi
+            if [ -f "${restore_tmp}/user.db_entry" ]; then
+                local u_entry
+                u_entry=$(cat "${restore_tmp}/user.db_entry")
+                local u_name
+                u_name=$(echo "$u_entry" | cut -d: -f1)
+                grep -v "^${u_name}:" "$USERS_DB" > "${USERS_DB}.tmp" 2>/dev/null || true
+                echo "$u_entry" >> "${USERS_DB}.tmp"
+                mv "${USERS_DB}.tmp" "$USERS_DB"
+                echo -e "  ✔ Re-registered tenant '${u_name}' in users database"
+            fi
+
+            rm -rf "$restore_tmp"
+            echo -e "${GREEN}🎉 Server state restored successfully! Refresh containers with: ${BOLD}./rig-server up${RESET}"
+            ;;
+
+        *)
+            echo "📦 OpenRig-Server Secure Encrypted Backup & Restore (AES-256-CBC PBKDF2):"
+            echo "  rig-server backup export [--all|<username>] [--out <file.rigpack>]"
+            echo "  rig-server backup restore <file.rigpack>"
+            ;;
+    esac
+}
+
+cmd_migrate() {
+    local sub="${1:-help}"
+    shift || true
+
+    case "$sub" in
+        push)
+            local target_server="${1:?Usage: rig-server migrate push <target_server_ip[:port]> [--all|<user>]}"
+            shift || true
+            local target_user="--all"
+            local key_file=""
+            local pass_val=""
+
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    --all) target_user="--all"; shift ;;
+                    --key-file) key_file="$2"; shift 2 ;;
+                    --pass) pass_val="$2"; shift 2 ;;
+                    *) target_user="$1"; shift ;;
+                esac
+            done
+
+            local host="${target_server%:*}"
+            local port="${target_server##*:}"
+            [ "$host" = "$port" ] && port="22"
+
+            echo -e "${CYAN}🚀 Migrating OpenRig-Server state (${target_user}) to ${host}:${port}...${RESET}"
+
+            if [ -n "$key_file" ] && [ -f "$key_file" ]; then
+                pass_val=$(cat "$key_file")
+            elif [ -z "$pass_val" ]; then
+                echo -e "${CYAN}🔐 Set AES-256 encryption password for in-transit network stream:${RESET}"
+                read -s -p "Enter migration encryption password: " pass_val
+                echo ""
+            fi
+
+            local temp_pack
+            temp_pack=$(mktemp /tmp/server-migrate.XXXXXX.rigpack)
+            cmd_backup export "$target_user" "$temp_pack" --pass "$pass_val" >/dev/null
+
+            echo -e "📡 Streaming encrypted server bundle to ${host}:${port}..."
+            local remote_cmd="mkdir -p /tmp/openrig-migrate && cat > /tmp/openrig-migrate/in.rigpack && echo '✔ Ingested encrypted package on target server'"
+
+            if ssh -p "$port" "${host}" "$remote_cmd" < "$temp_pack"; then
+                echo -e "${GREEN}🎉 Server bundle successfully transferred to ${host}!${RESET}"
+                echo -e "👉 On the destination server, run: ${BOLD}rig-server backup restore /tmp/openrig-migrate/in.rigpack${RESET}"
+            else
+                echo -e "${RED}❌ Migration transfer failed. Check SSH connectivity.${RESET}"
+            fi
+            rm -f "$temp_pack"
+            ;;
+        *)
+            echo "📡 OpenRig-Server Live Network Migration (rig-server migrate):"
+            echo "  rig-server migrate push <target_server_ip[:port]> [--all|<username>]"
+            ;;
+    esac
 }
 
 cmd_scale() {
@@ -604,6 +807,7 @@ case "$ACTION" in
     ai)                   cmd_ai "$@" ;;
     invite|inv)           cmd_invite "$@" ;;
     backup)               cmd_backup "$@" ;;
+    migrate)              cmd_migrate "$@" ;;
     help|-h|--help|*)
         banner
         echo -e "${GREEN}${BOLD}📍 Context: SERVER ADMINISTRATOR CLI (OpenRig-Server Multi-Tenant Hub)${RESET}\n"
@@ -618,6 +822,10 @@ case "$ACTION" in
         echo "  rig-server invite list           -> List invitations and bound Hardware IDs per user"
         echo "  rig-server status                -> Dashboard of users, ports, quotas, and live consumption"
         echo "  rig-server user [stop|start|remove] <user>"
-        echo "  rig-server backup <user>         -> Create a .tar.gz backup of a developer's workspace"
+        echo ""
+        echo -e "${BOLD}Encrypted Server Backup & Migration (AES-256 Military Grade):${RESET}"
+        echo "  rig-server backup export [--all|<user>] -> Create AES-256 password-encrypted .rigpack bundle"
+        echo "  rig-server backup restore <file.rigpack>-> Decrypt and restore server state or tenant on any server"
+        echo "  rig-server migrate push <srv:22> [--all] -> Live stream encrypted server state to another server"
         ;;
 esac
