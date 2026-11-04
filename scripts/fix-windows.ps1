@@ -184,6 +184,17 @@ try {
     if ($dockerVer) {
         $dockerRunning = $true
         Write-Host "✔ Container engine is running ($dockerVer)." -ForegroundColor Green
+
+        # Ensure official OpenRig image is pre-pulled from GHCR (prevents Docker Hub login errors)
+        $hasImage = (docker images -q openrig:fullstack 2>$null)
+        if (-not $hasImage) {
+            Write-Host "`n📥 Pre-pulling official OpenRig fullstack image from GitHub Container Registry (GHCR)..." -ForegroundColor Cyan
+            docker pull ghcr.io/lfr-snowball/openrig:fullstack
+            docker tag ghcr.io/lfr-snowball/openrig:fullstack openrig:fullstack
+            Write-Host "✔ Pre-warmed image 'openrig:fullstack' is ready." -ForegroundColor Green
+        } else {
+            Write-Host "✔ Image 'openrig:fullstack' is already present locally." -ForegroundColor Green
+        }
     }
 } catch {}
 
