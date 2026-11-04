@@ -25,6 +25,19 @@ USERS_DB="${SERVER_DIR}/config/users.db"
 mkdir -p "$WORKSPACES_DIR" "$BACKUPS_DIR" "${SERVER_DIR}/config"
 touch "$USERS_DB"
 
+get_server_ip() {
+    local ip=""
+    if command -v ipconfig.exe >/dev/null 2>&1; then
+        ip=$(ipconfig.exe | grep -i "IPv4" | awk -F: '{print $2}' | tr -d '\r ' | head -n 1)
+    elif command -v cmd.exe >/dev/null 2>&1; then
+        ip=$(cmd.exe /c "ipconfig" 2>/dev/null | grep -i "IPv4" | awk -F: '{print $2}' | tr -d '\r ' | head -n 1)
+    elif command -v ipconfig >/dev/null 2>&1 && [ "$(uname)" = "Darwin" ]; then
+        ip=$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null)
+    fi
+    [ -z "$ip" ] && ip=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "127.0.0.1")
+    echo "$ip"
+}
+
 SERVER_VERSION="1.1.0"
 [ -f "${SERVER_DIR}/VERSION" ] && SERVER_VERSION=$(cat "${SERVER_DIR}/VERSION" | tr -d '\r\n')
 
@@ -174,8 +187,7 @@ cmd_user_create() {
     echo "${username}:${port}:${role}:${ram}:${cpus}:$(date +%Y-%m-%d)" >> "$USERS_DB"
 
     local server_ip
-    server_ip=$(ipconfig getifaddr en0 2>/dev/null || hostname -I 2>/dev/null | awk '{print $1}' || echo "127.0.0.1")
-    [ -z "$server_ip" ] && server_ip="127.0.0.1"
+    server_ip=$(get_server_ip)
 
     echo -e "${GREEN}✅ Workstation '${container_name}' active on SSH port ${port}.${RESET}"
     echo ""
@@ -578,7 +590,7 @@ cmd_invite() {
             fi
 
             # Ensure Gatekeeper is running on port 7070
-            if ! lsof -iTCP:7070 -sTCP:LISTEN >/dev/null 2>&1; then
+            if ! lsof -iTCP:7070 -sTCP:LISTEN >/dev/null 2>&1 && ! ss -tlpn 2>/dev/null | grep -q ":7070 "; then
                 nohup python3 "${SERVER_DIR}/gatekeeper.py" >/tmp/openrig-gatekeeper.log 2>&1 &
                 sleep 1
             fi
@@ -602,8 +614,7 @@ data[token] = {
 open(path, "w").write(json.dumps(data, indent=2))
 PY
             local server_ip
-            server_ip=$(ipconfig getifaddr en0 2>/dev/null || echo "127.0.0.1")
-            [ -z "$server_ip" ] && server_ip="127.0.0.1"
+            server_ip=$(get_server_ip)
 
             echo -e "${GREEN}🎟️  Single-use invitation generated for '${username}' (Expires in ${ttl_hours}h):${RESET}"
             echo -e "   • Role: ${role} | Quota: ${ram} RAM, ${cpus} CPUs | Revokes previous PC: ${replace_prev}"
