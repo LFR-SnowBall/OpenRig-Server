@@ -1,0 +1,8 @@
+# Enforce LF endings on all scripts across Windows, Mac, Linux
+* text=auto eol=lf
+*.sh text eol=lf
+*.ps1 text eol=crlf
+*.cmd text eol=crlf
+*.bat text eol=crlf
+rig text eol=lf
+rig-server text eol=lf
