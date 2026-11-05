@@ -380,6 +380,7 @@ cmd_user_create() {
     fi
 
     docker run -d \
+        --init \
         --name "$container_name" \
         --hostname "rig-${username}" \
         --network "$net_name" \
