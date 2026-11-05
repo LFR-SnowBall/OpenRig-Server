@@ -357,14 +357,19 @@ cmd_user_create() {
     local upstream_sock
     upstream_sock=$(get_upstream_docker_sock)
     if [ -n "$upstream_sock" ]; then
-        local sockets_dir
-        sockets_dir=$(get_sockets_dir)
-        local user_sock="${sockets_dir}/${username}.sock"
-        ensure_docker_proxy "$username" "$user_sock"
-        if [ -S "$user_sock" ]; then
-            sock_opt=(-v "${user_sock}:/var/run/docker.sock")
+        if [ "${OPENRIG_SCOPED_DOCKER_PROXY:-false}" = "true" ]; then
+            local sockets_dir
+            sockets_dir=$(get_sockets_dir)
+            local user_sock="${sockets_dir}/${username}.sock"
+            ensure_docker_proxy "$username" "$user_sock"
+            if [ -S "$user_sock" ]; then
+                sock_opt=(-v "${user_sock}:/var/run/docker.sock")
+            else
+                echo -e "${YELLOW}⚠️  Could not bind scoped docker socket '${user_sock}'. Falling back to upstream '${upstream_sock}'...${RESET}"
+                sock_opt=(-v "${upstream_sock}:/var/run/docker.sock")
+            fi
         else
-            echo -e "${YELLOW}⚠️  Could not bind scoped docker socket '${user_sock}'. Falling back to upstream '${upstream_sock}'...${RESET}"
+            echo -e "${GREEN}🐳 Mounting native host Docker socket '${upstream_sock}'...${RESET}"
             sock_opt=(-v "${upstream_sock}:/var/run/docker.sock")
         fi
     fi
@@ -514,13 +519,20 @@ cmd_user_action() {
                 ram=$(echo "$entry" | cut -d: -f4)
                 cpus=$(echo "$entry" | cut -d: -f5)
             fi
-            local existing_keys=""
+            local saved_keys_file="${SERVER_DIR}/config/keys/${username}.keys"
+            mkdir -p "${SERVER_DIR}/config/keys"
             if docker inspect "$cname" >/dev/null 2>&1; then
-                existing_keys=$(docker exec "$cname" cat /etc/openrig/authorized_keys 2>/dev/null || true)
+                docker exec -u root "$cname" cat /etc/openrig/authorized_keys > "$saved_keys_file" 2>/dev/null || true
             fi
-            echo -e "${CYAN}🔄 Recreating workstation for '${username}' with Sibling Containers Docker socket...${RESET}"
+            echo -e "${CYAN}🔄 Recreating workstation for '${username}' with native Docker socket...${RESET}"
             docker rm -f "$cname" >/dev/null 2>&1 || true
-            cmd_user_create "$username" --role "$role" --ram "$ram" --cpus "$cpus" --port "$port" --ssh-key "$existing_keys"
+            cmd_user_create "$username" --role "$role" --ram "$ram" --cpus "$cpus" --port "$port"
+            if [ -s "$saved_keys_file" ]; then
+                docker exec -u root "$cname" mkdir -p /etc/openrig
+                docker cp "$saved_keys_file" "${cname}:/etc/openrig/authorized_keys"
+                docker exec -u root "$cname" chown root:root /etc/openrig/authorized_keys
+                docker exec -u root "$cname" chmod 644 /etc/openrig/authorized_keys
+            fi
             echo -e "${GREEN}✔ Workstation '${cname}' successfully recreated with Docker socket active.${RESET}"
             ;;
         sessions|history|log)
