@@ -381,6 +381,7 @@ cmd_user_create() {
 
     docker run -d \
         --init \
+        --restart unless-stopped \
         --name "$container_name" \
         --hostname "rig-${username}" \
         --network "$net_name" \
