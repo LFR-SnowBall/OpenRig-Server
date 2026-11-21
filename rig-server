@@ -495,6 +495,138 @@ pkill -HUP -x sshd 2>/dev/null || true
 EOH
 }
 
+install_ide_bridge_hook() {
+    local username="$1"
+    local cname="openrig-user-${username}"
+    docker exec -i -u root "$cname" bash -s << 'EOI'
+set -e
+mkdir -p /usr/local/libexec
+cat << 'EOR' > /usr/local/libexec/rig-open-ide
+#!/usr/bin/env bash
+set -e
+REQUESTED_IDE=""
+TARGET_ARG="."
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --ide)
+            REQUESTED_IDE="${2:-}"
+            shift 2 || break
+            ;;
+        --ide=*)
+            REQUESTED_IDE="${1#--ide=}"
+            shift
+            ;;
+        --)
+            shift
+            [ "$#" -gt 0 ] && TARGET_ARG="$1"
+            break
+            ;;
+        -*)
+            shift
+            ;;
+        *)
+            TARGET_ARG="$1"
+            shift
+            ;;
+    esac
+done
+TARGET_PATH=$(realpath "$TARGET_ARG" 2>/dev/null || pwd)
+
+INVOKED_AS="$(basename "$0")"
+if [ -z "$REQUESTED_IDE" ]; then
+    if [ "$INVOKED_AS" = "rig-open-ide" ]; then
+        REQUESTED_IDE="${OPENRIG_IDE:-auto}"
+    else
+        REQUESTED_IDE="$INVOKED_AS"
+    fi
+fi
+REQ_LOWER=$(printf '%s' "$REQUESTED_IDE" | tr '[:upper:]' '[:lower:]')
+
+# 1. If running inside an active VS Code-family Remote-SSH terminal, use matching native IPC hook
+if [ -n "${VSCODE_IPC_HOOK_CLI:-}" ]; then
+    REMOTE_CLI=""
+    case "$REQ_LOWER" in
+        auto|rig-open-ide|default)
+            REMOTE_CLI=$(find "$HOME/.antigravity-ide-server" "$HOME/.antigravity-server" "$HOME/.cursor-server" "$HOME/.windsurf-server" "$HOME/.kiro-server" "$HOME/.vscode-server" "$HOME/.vscode-server-insiders" "$HOME/.vscodium-server" -path "*/remote-cli/*" -type f -executable 2>/dev/null | head -n 1 || true)
+            ;;
+        antigravity|antigravity-ide)
+            REMOTE_CLI=$(find "$HOME/.antigravity-ide-server" "$HOME/.antigravity-server" -path "*/remote-cli/*" -type f -executable 2>/dev/null | head -n 1 || true)
+            ;;
+        cursor)
+            REMOTE_CLI=$(find "$HOME/.cursor-server" -path "*/remote-cli/*" -type f -executable 2>/dev/null | head -n 1 || true)
+            ;;
+        code|vscode)
+            REMOTE_CLI=$(find "$HOME/.vscode-server" -path "*/remote-cli/*" -type f -executable 2>/dev/null | head -n 1 || true)
+            ;;
+        code-insiders)
+            REMOTE_CLI=$(find "$HOME/.vscode-server-insiders" -path "*/remote-cli/*" -type f -executable 2>/dev/null | head -n 1 || true)
+            ;;
+        windsurf)
+            REMOTE_CLI=$(find "$HOME/.windsurf-server" -path "*/remote-cli/*" -type f -executable 2>/dev/null | head -n 1 || true)
+            ;;
+        kiro)
+            REMOTE_CLI=$(find "$HOME/.kiro-server" -path "*/remote-cli/*" -type f -executable 2>/dev/null | head -n 1 || true)
+            ;;
+        codium|vscodium)
+            REMOTE_CLI=$(find "$HOME/.vscodium-server" -path "*/remote-cli/*" -type f -executable 2>/dev/null | head -n 1 || true)
+            ;;
+    esac
+    if [ -n "$REMOTE_CLI" ]; then
+        "$REMOTE_CLI" --new-window "$TARGET_PATH" && exit 0
+    fi
+fi
+
+# 2. Try Reverse SSH Bridge to Host OS (port 7071)
+HOST_ALIAS="${OPENRIG_SSH_ALIAS:-}"
+if [ -z "$HOST_ALIAS" ]; then
+    if [[ "$(hostname)" == rig-* ]]; then
+        HOST_ALIAS="openrig-${HOSTNAME#rig-}"
+    else
+        HOST_ALIAS="openrig"
+    fi
+fi
+ENC_PATH="$TARGET_PATH"
+ENC_IDE="$REQ_LOWER"
+if command -v python3 >/dev/null 2>&1; then
+    ENC_PATH=$(python3 -c 'import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1], safe="/"))' "$TARGET_PATH" 2>/dev/null || echo "$TARGET_PATH")
+    ENC_IDE=$(python3 -c 'import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$REQ_LOWER" 2>/dev/null || echo "$REQ_LOWER")
+fi
+HTTP_CODE=$(curl -s -m 3 -o /dev/null -w "%{http_code}" "http://127.0.0.1:7071/open?alias=${HOST_ALIAS}&path=${ENC_PATH}&ide=${ENC_IDE}" 2>/dev/null || true)
+case "$HTTP_CODE" in
+    200)
+        echo "🚀 [OpenRig IDE Bridge] Remote signal sent! Opening '${REQUESTED_IDE}' on your Host screen attached to '${HOST_ALIAS}:${TARGET_PATH}'..."
+        exit 0
+        ;;
+    400)
+        echo "❌ [OpenRig IDE Bridge] Invalid IDE or path: ide='${REQUESTED_IDE}', path='${TARGET_PATH}'." >&2
+        exit 1
+        ;;
+    500)
+        echo "❌ [OpenRig IDE Bridge] IDE '${REQUESTED_IDE}' is not installed or unavailable on your Host OS." >&2
+        exit 1
+        ;;
+esac
+
+# 3. Fallback: Trigger the Host OS IDE Watcher via /workspace/.openrig-ide-trigger
+printf '%s\n%s\n' "$TARGET_PATH" "$REQ_LOWER" > /workspace/.openrig-ide-trigger
+echo "🚀 [OpenRig IDE Bridge] Triggered Host IDE watcher (${REQUESTED_IDE}) for '${HOST_ALIAS}:${TARGET_PATH}'..."
+EOR
+chown root:root /usr/local/libexec/rig-open-ide
+chmod 755 /usr/local/libexec/rig-open-ide
+cp /usr/local/libexec/rig-open-ide /usr/local/bin/rig-open-ide
+chown root:root /usr/local/bin/rig-open-ide
+chmod 755 /usr/local/bin/rig-open-ide
+for ide_cmd in code antigravity cursor windsurf kiro codium trae code-insiders zed idea pycharm webstorm goland rider clion phpstorm rubymine rustrover gateway; do
+    if [ ! -e "/usr/local/bin/${ide_cmd}" ] || [ -L "/usr/local/bin/${ide_cmd}" ]; then
+        ln -sf /usr/local/bin/rig-open-ide "/usr/local/bin/${ide_cmd}"
+    fi
+done
+if pgrep -f "/usr/local/bin/openrig-entrypoint.sh" >/dev/null 2>&1; then
+    nohup bash -c 'for i in $(seq 1 120); do pgrep -f "/usr/local/bin/openrig-entrypoint.sh" >/dev/null 2>&1 || break; sleep 1; done; cp /usr/local/libexec/rig-open-ide /usr/local/bin/rig-open-ide && chown root:root /usr/local/bin/rig-open-ide && chmod 755 /usr/local/bin/rig-open-ide' >/dev/null 2>&1 &
+fi
+EOI
+}
+
 backup_user_keys() {
     local username="$1"
     ensure_server_authority
@@ -685,6 +817,7 @@ cmd_user_create() {
         sync_user_keys "$username" || true
     fi
     install_signed_auth_hook "$username"
+    install_ide_bridge_hook "$username" || true
     provision_worker_ai_ticket "$username" || true
 
     # Record in users.db
@@ -734,6 +867,7 @@ cmd_user_action() {
             echo -e "${YELLOW}🔒 [OpenRig Audit] Access logged (ID: ${BOLD}${aid}${RESET}${YELLOW}).${RESET}"
             echo -e "${CYAN}📢 Notifying user '${username}' of administrative shell access...${RESET}"
             notify_user_container "$cname" "INDEPENDENT_SHELL" "$admin_u" "$srv_h"
+            install_ide_bridge_hook "$username" || true
             
             docker exec -it -u rig -w /workspace "$cname" zsh -l || true
             
@@ -752,6 +886,7 @@ cmd_user_action() {
             echo -e "${YELLOW}🔒 [OpenRig Audit] Access logged (ID: ${BOLD}${aid}${RESET}${YELLOW}).${RESET}"
             echo -e "${CYAN}📢 Notifying user '${username}' of live pair-programming attach...${RESET}"
             notify_user_container "$cname" "LIVE_PAIRING_ATTACH" "$admin_u" "$srv_h"
+            install_ide_bridge_hook "$username" || true
             
             if docker exec "$cname" tmux has-session -t openrig >/dev/null 2>&1; then
                 docker exec -it -u rig "$cname" tmux attach-session -t openrig || true
@@ -789,6 +924,7 @@ cmd_user_action() {
                 cmd_user_action recreate "$username"
                 return 0
             fi
+            install_ide_bridge_hook "$username" || true
             echo -e "${GREEN}▶️  Workstation for '${username}' started.${RESET}"
             ;;
         recreate|reload)
@@ -1762,6 +1898,102 @@ PY
     esac
 }
 
+set_default_host_ide() {
+    local raw="${1:-}"
+    local pref_file="$HOME/.openrig/ide"
+    if [ -z "$raw" ]; then
+        local curr="auto"
+        if [ -n "${OPENRIG_IDE:-}" ]; then
+            curr="$OPENRIG_IDE"
+        elif [ -f "$pref_file" ]; then
+            curr=$(head -n 1 "$pref_file" 2>/dev/null | tr -d '\r\n ' || echo "auto")
+        fi
+        echo -e "${CYAN}Default Host IDE:${RESET} ${curr:-auto}"
+        echo "Supported: auto, antigravity, cursor, code, code-insiders, windsurf, kiro, codium, trae, zed, idea, pycharm, webstorm, goland, rider, clion, phpstorm, rubymine, rustrover, gateway"
+        return 0
+    fi
+    local norm
+    norm=$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
+    case "$norm" in
+        ""|rig-open-ide|default|auto) norm="auto" ;;
+        antigravity-ide) norm="antigravity" ;;
+        vscode) norm="code" ;;
+        vscodium) norm="codium" ;;
+        intellij) norm="idea" ;;
+    esac
+    case "$norm" in
+        auto|antigravity|cursor|code|code-insiders|windsurf|kiro|codium|trae|zed|idea|pycharm|webstorm|goland|rider|clion|phpstorm|rubymine|rustrover|gateway) ;;
+        *)
+            echo -e "${RED}❌ Invalid IDE '${raw}'.${RESET}" >&2
+            return 1
+            ;;
+    esac
+    mkdir -p "$HOME/.openrig"
+    printf '%s\n' "$norm" > "$pref_file"
+    echo -e "${GREEN}✅ Default Host IDE set to '${norm}' (${pref_file}).${RESET}"
+}
+
+cmd_ide_bridge() {
+    local sub="${1:-status}"
+    shift || true
+    local pid_file="${SERVER_DIR}/sockets/ide-bridge.pid"
+    local log_file="${LOGS_DIR}/ide-bridge.log"
+    mkdir -p "${SERVER_DIR}/sockets" "${LOGS_DIR}"
+    case "$sub" in
+        start)
+            if curl -sf -m 1 "http://127.0.0.1:7071/health" 2>/dev/null | grep -q "^OK$"; then
+                echo -e "${GREEN}✔ OpenRig Server Host IDE Bridge already active on 127.0.0.1:7071.${RESET}"
+                return 0
+            fi
+            if [ -f "$pid_file" ] && kill -0 "$(cat "$pid_file" 2>/dev/null)" 2>/dev/null; then
+                echo -e "${GREEN}✔ OpenRig Server Host IDE Bridge already running (PID $(cat "$pid_file")).${RESET}"
+                return 0
+            fi
+            nohup python3 "${SERVER_DIR}/scripts/ide-bridge-daemon.py" --mode server --watch-root "${WORKSPACES_DIR}" >"$log_file" 2>&1 &
+            local bpid=$!
+            echo "$bpid" > "$pid_file"
+            disown 2>/dev/null || true
+            echo -e "${GREEN}🚀 OpenRig Server Host IDE Bridge started on 127.0.0.1:7071 (PID ${bpid}).${RESET}"
+            ;;
+        stop)
+            if [ -f "$pid_file" ]; then
+                kill "$(cat "$pid_file" 2>/dev/null)" 2>/dev/null || true
+                rm -f "$pid_file"
+            fi
+            echo -e "${YELLOW}🛑 OpenRig Server Host IDE Bridge stopped.${RESET}"
+            ;;
+        restart)
+            cmd_ide_bridge stop
+            sleep 0.3
+            cmd_ide_bridge start
+            ;;
+        default)
+            set_default_host_ide "${1:-}"
+            ;;
+        list)
+            if curl -sf -m 1 "http://127.0.0.1:7071/ides" 2>/dev/null; then
+                :
+            else
+                python3 "${SERVER_DIR}/scripts/ide-bridge-daemon.py" --list-ides
+            fi
+            ;;
+        *)
+            local def_ide="auto"
+            if [ -n "${OPENRIG_IDE:-}" ]; then
+                def_ide="$OPENRIG_IDE"
+            elif [ -f "$HOME/.openrig/ide" ]; then
+                def_ide=$(head -n 1 "$HOME/.openrig/ide" 2>/dev/null | tr -d '\r\n ' || echo "auto")
+            fi
+            if curl -sf -m 1 "http://127.0.0.1:7071/health" 2>/dev/null | grep -q "^OK$"; then
+                echo -e "${GREEN}✅ OpenRig Server Host IDE Bridge: ONLINE (127.0.0.1:7071, default=${def_ide})${RESET}"
+                curl -sf -m 1 "http://127.0.0.1:7071/ides" 2>/dev/null || true
+            else
+                echo -e "${YELLOW}⏸️  OpenRig Server Host IDE Bridge: OFFLINE (default=${def_ide})${RESET}"
+            fi
+            ;;
+    esac
+}
+
 ACTION="${1:-help}"
 shift || true
 
@@ -1782,6 +2014,7 @@ case "$ACTION" in
     restart)              cmd_user_action "stop" "$@" && cmd_user_action "start" "$@" ;;
     stop)                 cmd_user_action "stop" "$@" ;;
     start)                cmd_user_action "start" "$@" ;;
+    ide-bridge|bridge)    cmd_ide_bridge "$@" ;;
     authority|ca)         cmd_authority "$@" ;;
     keys|key)             cmd_keys "$@" ;;
     audit|logs)           cmd_audit "$@" ;;
@@ -1807,6 +2040,7 @@ case "$ACTION" in
         echo "  rig-server ai [set|status|pause|resume] -> Manage Shared Zero-Key Corporate AI Broker (Bedrock/Anthropic/Gemini/OpenAI)"
         echo "  rig-server dlp <user> --mode [sanitized|approval|airgapped] [--block-terms 'corp,secret']"
         echo "  rig-server brain-requests        -> Review, approve, or reject user 'rig brain learn' exports"
+        echo "  rig-server ide-bridge [start|stop|restart|status|default <ide>|list] -> Host IDE Bridge (:7071)"
         echo "  rig-server authority status      -> Show Ed25519 key-signing authority & tenant integrity"
         echo "  rig-server keys [list|verify|sign|revoke] -> Manage & verify cryptographically signed SSH keys"
         echo "  rig-server invite create --user <user> [--role fullstack] [--ram 4g] [--cpus 2]"

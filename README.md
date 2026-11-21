@@ -168,6 +168,7 @@ Share a corporate **AWS Bedrock, Anthropic, Google Gemini, OpenAI, or LiteLLM** 
 | `rig-server invite create --user <u > [--replace]` | Generate a new single-use enrollment token (with `--replace` to unlink old hardware) |
 | `rig-server invite list` / `revoke <token>` | List or revoke active invitation tokens |
 | `rig-server status` | Display provisioned tenants, SSH ports, quotas, and live `docker stats` |
+| `rig-server ide-bridge [start\|stop\|restart\|status\|default <ide>\|list]` | Manage the multi-IDE Host Bridge (`127.0.0.1:7071` + `.openrig-ide-trigger`, supports VS Code family, Zed, JetBrains Gateway) |
 | `rig-server backup [user \| all]` | Create timestamped `.tar.gz` backups of user workspaces |
 | `rig-server user [stop \| start \| remove] <user>` | Stop, start, or remove a tenant workstation |
 
