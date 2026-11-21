@@ -8,10 +8,14 @@ Security Controls:
 4. Root-owned /etc/openrig/authorized_keys enforcement inside container
 """
 
+import base64
 import json
 import os
 import re
+import shutil
 import subprocess
+import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -21,11 +25,18 @@ from typing import Dict, List, Tuple
 
 SERVER_DIR = Path(__file__).resolve().parent
 CONFIG_DIR = SERVER_DIR / "config"
+AUTHORITY_DIR = CONFIG_DIR / "authority"
+AUTHORITY_KEY = AUTHORITY_DIR / "server_ca"
+AUTHORITY_PUB = AUTHORITY_DIR / "server_ca.pub"
+ALLOWED_SIGNERS = AUTHORITY_DIR / "allowed_signers"
+KEYS_DIR = CONFIG_DIR / "keys"
 INVITES_FILE = CONFIG_DIR / "invites.json"
 AI_BROKER_FILE = CONFIG_DIR / "ai-broker.json"
 USERS_DB = CONFIG_DIR / "users.db"
 
 CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+AUTHORITY_DIR.mkdir(parents=True, exist_ok=True)
+KEYS_DIR.mkdir(parents=True, exist_ok=True)
 if not INVITES_FILE.exists():
     INVITES_FILE.write_text("{}", encoding="utf-8")
 if not AI_BROKER_FILE.exists():
@@ -46,6 +57,18 @@ if not AI_BROKER_FILE.exists():
 RE_SAFE_NAME = re.compile(r"^[a-zA-Z0-9._-]{2,32}$")
 RE_SAFE_HEX = re.compile(r"^[a-fA-F0-9]{32,128}$")
 RE_SAFE_CODE = re.compile(r"^[0-9]{6}$")
+RE_SAFE_PUBKEY = re.compile(
+    r"^(?:ssh-(?:ed25519|rsa|dss)|ecdsa-sha2-nistp(?:256|384|521)|sk-(?:ssh-ed25519|ecdsa-sha2-nistp256)@openssh\.com) "
+    r"[A-Za-z0-9+/=]{32,}(?: [^\r\n\"'`$\\;<>|&]{1,128})?$"
+)
+
+
+def is_valid_ssh_pubkey(pubkey: str) -> bool:
+    if not pubkey or len(pubkey) > 2048:
+        return False
+    if "\n" in pubkey or "\r" in pubkey or "\x00" in pubkey:
+        return False
+    return bool(RE_SAFE_PUBKEY.match(pubkey))
 
 # In-memory security trackers
 FAILED_ATTEMPTS: Dict[str, List[float]] = {}
@@ -75,6 +98,180 @@ def load_invites():
 
 def save_invites(data):
     INVITES_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+
+KEYS_LOCK = threading.RLock()
+GUEST_TIMERS: Dict[str, threading.Timer] = {}
+
+
+def get_volume_helper_image() -> str:
+    res = subprocess.run(["docker", "image", "inspect", "alpine"], capture_output=True)
+    return "alpine" if res.returncode == 0 else "openrig:fullstack"
+
+
+def ensure_server_authority() -> None:
+    """Auto-bootstrap host-only Ed25519 signing authority and allowed_signers."""
+    with KEYS_LOCK:
+        AUTHORITY_DIR.mkdir(parents=True, exist_ok=True)
+        KEYS_DIR.mkdir(parents=True, exist_ok=True)
+        if (not AUTHORITY_KEY.is_file() or AUTHORITY_KEY.stat().st_size == 0 or
+                not AUTHORITY_PUB.is_file() or AUTHORITY_PUB.stat().st_size == 0):
+            with tempfile.TemporaryDirectory(prefix="openrig-ca-") as tmpd:
+                os.chmod(tmpd, 0o700)
+                ca_tmp = Path(tmpd) / "server_ca"
+                subprocess.run(
+                    ["ssh-keygen", "-t", "ed25519", "-N", "", "-C", "openrig-server-authority", "-f", str(ca_tmp)],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    check=True,
+                )
+                shutil.copyfile(ca_tmp, AUTHORITY_KEY)
+                shutil.copyfile(f"{ca_tmp}.pub", AUTHORITY_PUB)
+            for path, mode in ((AUTHORITY_KEY, 0o600), (AUTHORITY_PUB, 0o644)):
+                try:
+                    os.chmod(path, mode)
+                except Exception:
+                    pass
+        pub_line = AUTHORITY_PUB.read_text(encoding="utf-8").strip()
+        expected = f"openrig-authority {pub_line}\n"
+        if not ALLOWED_SIGNERS.is_file() or ALLOWED_SIGNERS.read_text(encoding="utf-8") != expected:
+            tmp_s = AUTHORITY_DIR / f"allowed_signers.tmp.{os.getpid()}"
+            with open(tmp_s, "w", encoding="utf-8", newline="\n") as f:
+                f.write(expected)
+            try:
+                os.chmod(tmp_s, 0o644)
+            except Exception:
+                pass
+            os.replace(tmp_s, ALLOWED_SIGNERS)
+
+
+def verify_keys_signature(username: str, keys_text: str, sig_text: str) -> bool:
+    """Verify Ed25519 SSH signature for tenant-bound authorized_keys (fail-closed)."""
+    if not keys_text.strip() or not sig_text.strip():
+        return False
+    ensure_server_authority()
+    with tempfile.TemporaryDirectory(prefix="openrig-verify-") as tmpd:
+        os.chmod(tmpd, 0o700)
+        signers_tmp = Path(tmpd) / "allowed_signers"
+        sig_tmp = Path(tmpd) / "authorized_keys.sig"
+        signers_tmp.write_text(ALLOWED_SIGNERS.read_text(encoding="utf-8"), encoding="utf-8")
+        sig_tmp.write_text(sig_text, encoding="utf-8")
+        os.chmod(signers_tmp, 0o644)
+        res = subprocess.run(
+            [
+                "ssh-keygen", "-Y", "verify",
+                "-f", str(signers_tmp),
+                "-I", "openrig-authority",
+                "-n", f"openrig-authorized-keys:{username}",
+                "-s", str(sig_tmp),
+            ],
+            input=keys_text.encode("utf-8"),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return res.returncode == 0
+
+
+def sign_keys_text(username: str, keys_text: str) -> str:
+    """Sign authorized_keys with host Ed25519 CA using a 0700 temp directory."""
+    ensure_server_authority()
+    with tempfile.TemporaryDirectory(prefix="openrig-sign-") as tmpd:
+        os.chmod(tmpd, 0o700)
+        ca_tmp = Path(tmpd) / "server_ca"
+        payload_tmp = Path(tmpd) / "authorized_keys"
+        shutil.copyfile(AUTHORITY_KEY, ca_tmp)
+        os.chmod(ca_tmp, 0o600)
+        with open(payload_tmp, "wb") as f:
+            f.write(keys_text.encode("utf-8"))
+        subprocess.run(
+            [
+                "ssh-keygen", "-Y", "sign",
+                "-f", str(ca_tmp),
+                "-n", f"openrig-authorized-keys:{username}",
+                str(payload_tmp),
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=True,
+        )
+        return Path(f"{payload_tmp}.sig").read_text(encoding="utf-8")
+
+
+def publish_signed_auth_volume(username: str, keys_text: str, sig_text: str) -> None:
+    """Publish signed manifest + allowed_signers into Docker volume openrig-auth-<user>."""
+    ensure_server_authority()
+    helper_img = get_volume_helper_image()
+    b64_keys = base64.b64encode(keys_text.encode("utf-8")).decode("ascii") if keys_text else ""
+    b64_sig = base64.b64encode(sig_text.encode("utf-8")).decode("ascii") if sig_text else ""
+    b64_signers = base64.b64encode(ALLOWED_SIGNERS.read_bytes()).decode("ascii")
+    script = (
+        "set -e\n"
+        "rm -f /auth/ai-corporate.env /auth/dlp-policy.json\n"
+        f"printf '%s' '{b64_signers}' | base64 -d > /auth/allowed_signers.tmp\n"
+        + (f"printf '%s' '{b64_keys}' | base64 -d > /auth/authorized_keys.tmp\n" if b64_keys else ": > /auth/authorized_keys.tmp\n")
+        + (
+            f"printf '%s' '{b64_sig}' | base64 -d > /auth/authorized_keys.sig.tmp\n"
+            "chown root:root /auth/authorized_keys.sig.tmp && chmod 644 /auth/authorized_keys.sig.tmp\n"
+            "mv /auth/authorized_keys.sig.tmp /auth/authorized_keys.sig\n"
+            if b64_sig else "rm -f /auth/authorized_keys.sig /auth/authorized_keys.sig.tmp\n"
+        )
+        + "chown root:root /auth/authorized_keys.tmp /auth/allowed_signers.tmp\n"
+        + "chmod 644 /auth/authorized_keys.tmp /auth/allowed_signers.tmp\n"
+        + "mv /auth/authorized_keys.tmp /auth/authorized_keys\n"
+        + "mv /auth/allowed_signers.tmp /auth/allowed_signers\n"
+    )
+    subprocess.run(
+        [
+            "docker", "run", "--rm", "-i", "--entrypoint", "/bin/sh",
+            "-u", "root", "-v", f"openrig-auth-{username}:/auth", helper_img, "-s"
+        ],
+        input=script.encode("utf-8"),
+        stdout=subprocess.DEVNULL,
+        check=True,
+    )
+
+
+def save_and_publish_permanent_keys(username: str, keys_text: str) -> None:
+    """Sign, atomically store config/keys/<user>.keys(.sig), and publish to auth volume."""
+    sig_text = sign_keys_text(username, keys_text) if keys_text.strip() else ""
+    host_keys = KEYS_DIR / f"{username}.keys"
+    host_sig = KEYS_DIR / f"{username}.keys.sig"
+    tmp_keys = KEYS_DIR / f"{username}.keys.tmp.{os.getpid()}"
+    tmp_sig = KEYS_DIR / f"{username}.keys.sig.tmp.{os.getpid()}"
+    with open(tmp_keys, "w", encoding="utf-8", newline="\n") as f:
+        f.write(keys_text)
+    try:
+        os.chmod(tmp_keys, 0o600)
+    except Exception:
+        pass
+    os.replace(tmp_keys, host_keys)
+    if sig_text:
+        with open(tmp_sig, "w", encoding="utf-8", newline="\n") as f:
+            f.write(sig_text)
+        try:
+            os.chmod(tmp_sig, 0o644)
+        except Exception:
+            pass
+        os.replace(tmp_sig, host_sig)
+    elif host_sig.exists():
+        host_sig.unlink()
+    publish_signed_auth_volume(username, keys_text, sig_text)
+
+
+def _restore_permanent_keys_after_guest(username: str) -> None:
+    with KEYS_LOCK:
+        ensure_server_authority()
+        host_keys = KEYS_DIR / f"{username}.keys"
+        host_sig = KEYS_DIR / f"{username}.keys.sig"
+        if host_keys.is_file():
+            k_txt = host_keys.read_text(encoding="utf-8")
+            if k_txt.strip() and host_sig.is_file():
+                s_txt = host_sig.read_text(encoding="utf-8")
+                if verify_keys_signature(username, k_txt, s_txt):
+                    publish_signed_auth_volume(username, k_txt, s_txt)
+                    return
+        publish_signed_auth_volume(username, "", "")
 
 
 def verify_totp_once(cname: str, username: str, code: str) -> bool:
@@ -263,7 +460,7 @@ class GatekeeperHandler(BaseHTTPRequestHandler):
             dev_name = re.sub(r"[^a-zA-Z0-9._-]", "-", data.get("device_name", "workstation").strip())[:32]
             replace_prev = bool(data.get("replace_previous", True))
 
-            if not RE_SAFE_HEX.match(hw_id) or not pubkey.startswith("ssh-"):
+            if not RE_SAFE_HEX.match(hw_id) or not is_valid_ssh_pubkey(pubkey):
                 record_failure(client_ip)
                 return self._send_json(400, {"error": "Invalid hardware fingerprint or SSH public key"})
 
@@ -299,15 +496,30 @@ class GatekeeperHandler(BaseHTTPRequestHandler):
                     "--role", role, "--ram", ram, "--cpus", cpus
                 ], check=True)
 
-            # Bind SSH public key to Hardware UUID inside root-owned /etc/openrig/authorized_keys
+            # Bind SSH public key to Hardware UUID via Ed25519 signed manifest + kernel :ro mount
             guarded_key = f'command="/usr/local/bin/rig-session-guard {hw_id} {dev_name}" {pubkey}'
-            op = ">" if (replace_prev or inv.get("replace_previous", False)) else ">>"
+            should_replace = replace_prev or inv.get("replace_previous", False)
+            with KEYS_LOCK:
+                ensure_server_authority()
+                host_keys = KEYS_DIR / f"{username}.keys"
+                host_sig = KEYS_DIR / f"{username}.keys.sig"
+                lines: List[str] = []
+                if not should_replace and host_keys.is_file() and host_keys.read_text(encoding="utf-8").strip():
+                    existing_txt = host_keys.read_text(encoding="utf-8")
+                    existing_sig = host_sig.read_text(encoding="utf-8") if host_sig.is_file() else ""
+                    if not verify_keys_signature(username, existing_txt, existing_sig):
+                        return self._send_json(500, {
+                            "error": f"Security hold: existing keys for '{username}' failed signature verification"
+                        })
+                    lines = [ln.strip() for ln in existing_txt.splitlines() if ln.strip()]
+                if guarded_key not in lines:
+                    lines.append(guarded_key)
+                save_and_publish_permanent_keys(username, "\n".join(lines) + "\n")
+
             cmd = (
-                "sudo mkdir -p /etc/openrig /home/rig/.openrig-profiles && "
+                "sudo mkdir -p /home/rig/.openrig-profiles && "
                 "sudo chown -R rig:rig /home/rig/.openrig-profiles && "
-                f"echo {json.dumps(guarded_key)} | sudo tee {'-a' if op == '>>' else ''} /etc/openrig/authorized_keys >/dev/null && "
-                "sudo chown root:root /etc/openrig/authorized_keys && "
-                "sudo chmod 644 /etc/openrig/authorized_keys && "
+                "sudo rm -f /home/rig/.openrig-profiles/authorized_keys /etc/openrig/authorized_keys && "
                 "if [ ! -f /home/rig/.openrig-profiles/keychain.secret ]; then "
                 "head -c 10 /dev/urandom | base32 | tr -d '=' > /home/rig/.openrig-profiles/keychain.secret && "
                 "chmod 600 /home/rig/.openrig-profiles/keychain.secret; fi"
@@ -340,7 +552,7 @@ class GatekeeperHandler(BaseHTTPRequestHandler):
             totp_code = data.get("code", "").strip()
             temp_pubkey = data.get("temp_public_key", "").strip()
 
-            if not RE_SAFE_NAME.match(username) or not temp_pubkey.startswith("ssh-"):
+            if not RE_SAFE_NAME.match(username) or not is_valid_ssh_pubkey(temp_pubkey):
                 record_failure(client_ip)
                 return self._send_json(400, {"error": "Invalid username or temporary key"})
 
@@ -350,11 +562,28 @@ class GatekeeperHandler(BaseHTTPRequestHandler):
                 return self._send_json(403, {"error": "Invalid or already-used 6-digit Keychain TOTP code"})
 
             guarded_guest = f'command="/usr/local/bin/rig-session-guard GUEST_EPHEMERAL guest-temp" {temp_pubkey}'
-            cmd = (
-                f"echo {json.dumps(guarded_guest)} | sudo tee -a /etc/openrig/authorized_keys >/dev/null && "
-                "sudo chmod 644 /etc/openrig/authorized_keys"
-            )
-            subprocess.run(["docker", "exec", cname, "bash", "-c", cmd], check=True)
+            with KEYS_LOCK:
+                ensure_server_authority()
+                host_keys = KEYS_DIR / f"{username}.keys"
+                host_sig = KEYS_DIR / f"{username}.keys.sig"
+                perm_txt = ""
+                if host_keys.is_file() and host_keys.read_text(encoding="utf-8").strip():
+                    perm_txt = host_keys.read_text(encoding="utf-8")
+                    sig_txt = host_sig.read_text(encoding="utf-8") if host_sig.is_file() else ""
+                    if not verify_keys_signature(username, perm_txt, sig_txt):
+                        return self._send_json(500, {
+                            "error": f"Security hold: existing keys for '{username}' failed signature verification"
+                        })
+                combined = (perm_txt.rstrip("\n") + "\n" if perm_txt.strip() else "") + guarded_guest + "\n"
+                combined_sig = sign_keys_text(username, combined)
+                publish_signed_auth_volume(username, combined, combined_sig)
+                old_timer = GUEST_TIMERS.pop(username, None)
+                if old_timer is not None:
+                    old_timer.cancel()
+                t = threading.Timer(60.0, _restore_permanent_keys_after_guest, args=(username,))
+                t.daemon = True
+                t.start()
+                GUEST_TIMERS[username] = t
 
             ssh_port = "2201"
             for line in USERS_DB.read_text(encoding="utf-8").splitlines():
@@ -375,6 +604,7 @@ class GatekeeperHandler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    ensure_server_authority()
     port = int(os.environ.get("GATEKEEPER_PORT", "7070"))
     server = ThreadingHTTPServer(("0.0.0.0", port), GatekeeperHandler)
     print(f"🛡️ OpenRig Gatekeeper + Zero-Key AI Broker listening on 0.0.0.0:{port}")

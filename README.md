@@ -163,6 +163,8 @@ Share a corporate **AWS Bedrock, Anthropic, Google Gemini, OpenAI, or LiteLLM** 
 | `rig-server ai [set \| status \| pause \| resume]` | Configure Shared Zero-Key Corporate AI Broker (AWS Bedrock SigV4 / Anthropic / Gemini / OpenAI) & monitor per-user AI usage |
 | `rig-server dlp <user> --mode <M> [--block-terms <T>]` | Enforce Enterprise DLP policy (`sanitized`, `approval`, or `airgapped`) and blocked corporate keywords per tenant |
 | `rig-server brain-requests [approve \| reject] [user]` | Review, approve, or reject pending `rig brain learn` exports when a tenant is in `approval` mode |
+| `rig-server authority status` | Display the Ed25519 Server Signing Authority fingerprint and verify tenant key signatures |
+| `rig-server keys [list\|verify\|sign\|revoke]` | Inspect, cryptographically verify, sign (migrate), or revoke hardware-bound tenant SSH keys |
 | `rig-server invite create --user <u > [--replace]` | Generate a new single-use enrollment token (with `--replace` to unlink old hardware) |
 | `rig-server invite list` / `revoke <token>` | List or revoke active invitation tokens |
 | `rig-server status` | Display provisioned tenants, SSH ports, quotas, and live `docker stats` |

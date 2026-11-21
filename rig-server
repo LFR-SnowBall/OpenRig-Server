@@ -22,9 +22,14 @@ export PATH="${HOME}/.orbstack/bin:/Applications/OrbStack.app/Contents/MacOS/xbi
 WORKSPACES_DIR="${SERVER_DIR}/workspaces"
 BACKUPS_DIR="${SERVER_DIR}/backups"
 USERS_DB="${SERVER_DIR}/config/users.db"
+AUTHORITY_DIR="${SERVER_DIR}/config/authority"
+AUTHORITY_KEY="${AUTHORITY_DIR}/server_ca"
+AUTHORITY_PUB="${AUTHORITY_DIR}/server_ca.pub"
+ALLOWED_SIGNERS="${AUTHORITY_DIR}/allowed_signers"
+KEYS_DIR="${SERVER_DIR}/config/keys"
 LOGS_DIR="${SERVER_DIR}/logs"
 AUDIT_LOG="${LOGS_DIR}/audit.log"
-mkdir -p "$WORKSPACES_DIR" "$BACKUPS_DIR" "${SERVER_DIR}/config" "$LOGS_DIR"
+mkdir -p "$WORKSPACES_DIR" "$BACKUPS_DIR" "${SERVER_DIR}/config" "$LOGS_DIR" "$AUTHORITY_DIR" "$KEYS_DIR"
 touch "$USERS_DB" "$AUDIT_LOG"
 
 get_admin_identity() {
@@ -295,6 +300,266 @@ next_free_port() {
     echo "$port"
 }
 
+get_volume_helper_image() {
+    if docker image inspect alpine >/dev/null 2>&1; then
+        echo "alpine"
+    else
+        echo "openrig:fullstack"
+    fi
+}
+
+ensure_server_authority() {
+    mkdir -p "$AUTHORITY_DIR" "$KEYS_DIR"
+    if [ ! -s "$AUTHORITY_KEY" ] || [ ! -s "$AUTHORITY_PUB" ]; then
+        local tmpd
+        tmpd=$(mktemp -d /tmp/openrig-ca.XXXXXX)
+        chmod 700 "$tmpd"
+        ssh-keygen -t ed25519 -N "" -C "openrig-server-authority" -f "$tmpd/server_ca" </dev/null >/dev/null
+        mv "$tmpd/server_ca" "$AUTHORITY_KEY"
+        mv "$tmpd/server_ca.pub" "$AUTHORITY_PUB"
+        rm -rf "$tmpd"
+        chmod 600 "$AUTHORITY_KEY" 2>/dev/null || true
+        chmod 644 "$AUTHORITY_PUB" 2>/dev/null || true
+        log_audit_event "SERVER_AUTHORITY_INIT" "ED25519" "server" "Initialized Ed25519 key-signing authority" >/dev/null || true
+    fi
+    local pub_line expected_signers
+    pub_line=$(tr -d '\r\n' < "$AUTHORITY_PUB")
+    expected_signers="openrig-authority ${pub_line}"
+    if [ ! -s "$ALLOWED_SIGNERS" ] || [ "$(tr -d '\r\n' < "$ALLOWED_SIGNERS")" != "$expected_signers" ]; then
+        printf '%s\n' "$expected_signers" > "${ALLOWED_SIGNERS}.tmp.$$"
+        mv "${ALLOWED_SIGNERS}.tmp.$$" "$ALLOWED_SIGNERS"
+        chmod 644 "$ALLOWED_SIGNERS" 2>/dev/null || true
+    fi
+}
+
+verify_keys_signature() {
+    local username="$1"
+    local keys_file="$2"
+    local sig_file="$3"
+    ensure_server_authority
+    [ -s "$keys_file" ] && [ -s "$sig_file" ] && [ -s "$ALLOWED_SIGNERS" ] || return 1
+    local tmpd
+    tmpd=$(mktemp -d /tmp/openrig-verify.XXXXXX)
+    chmod 700 "$tmpd"
+    cp "$ALLOWED_SIGNERS" "$tmpd/allowed_signers"
+    chmod 644 "$tmpd/allowed_signers"
+    local rc=1
+    if ssh-keygen -Y verify -f "$tmpd/allowed_signers" -I "openrig-authority" -n "openrig-authorized-keys:${username}" -s "$sig_file" < "$keys_file" >/dev/null 2>&1; then
+        rc=0
+    fi
+    rm -rf "$tmpd"
+    return "$rc"
+}
+
+sign_keys_file() {
+    local username="$1"
+    local keys_file="$2"
+    local sig_out="$3"
+    ensure_server_authority
+    local tmpd
+    tmpd=$(mktemp -d /tmp/openrig-sign.XXXXXX)
+    chmod 700 "$tmpd"
+    cp "$AUTHORITY_KEY" "$tmpd/ca"
+    chmod 600 "$tmpd/ca"
+    cp "$keys_file" "$tmpd/payload"
+    if ! ssh-keygen -Y sign -f "$tmpd/ca" -n "openrig-authorized-keys:${username}" "$tmpd/payload" </dev/null >/dev/null 2>&1; then
+        rm -rf "$tmpd"
+        return 1
+    fi
+    cp "$tmpd/payload.sig" "${sig_out}.tmp.$$"
+    mv "${sig_out}.tmp.$$" "$sig_out"
+    chmod 644 "$sig_out" 2>/dev/null || true
+    rm -rf "$tmpd"
+}
+
+publish_auth_volume() {
+    local username="$1"
+    local keys_file="${2:-}"
+    local sig_file="${3:-}"
+    ensure_server_authority
+    local helper_img
+    helper_img=$(get_volume_helper_image)
+    local b64_keys="" b64_sig="" b64_signers=""
+    if [ -n "$keys_file" ] && [ -s "$keys_file" ]; then
+        b64_keys=$(base64 < "$keys_file" | tr -d '\r\n')
+    fi
+    if [ -n "$sig_file" ] && [ -s "$sig_file" ]; then
+        b64_sig=$(base64 < "$sig_file" | tr -d '\r\n')
+    fi
+    b64_signers=$(base64 < "$ALLOWED_SIGNERS" | tr -d '\r\n')
+
+    docker run --rm -i --entrypoint /bin/sh -u root -v "openrig-auth-${username}:/auth" "$helper_img" -s << EOS >/dev/null
+set -e
+rm -f /auth/ai-corporate.env /auth/dlp-policy.json
+printf '%s' '${b64_signers}' | base64 -d > /auth/allowed_signers.tmp
+if [ -n '${b64_keys}' ]; then
+  printf '%s' '${b64_keys}' | base64 -d > /auth/authorized_keys.tmp
+else
+  : > /auth/authorized_keys.tmp
+fi
+if [ -n '${b64_sig}' ]; then
+  printf '%s' '${b64_sig}' | base64 -d > /auth/authorized_keys.sig.tmp
+  chown root:root /auth/authorized_keys.sig.tmp
+  chmod 644 /auth/authorized_keys.sig.tmp
+  mv /auth/authorized_keys.sig.tmp /auth/authorized_keys.sig
+else
+  rm -f /auth/authorized_keys.sig /auth/authorized_keys.sig.tmp
+fi
+chown root:root /auth/authorized_keys.tmp /auth/allowed_signers.tmp
+chmod 644 /auth/authorized_keys.tmp /auth/allowed_signers.tmp
+mv /auth/authorized_keys.tmp /auth/authorized_keys
+mv /auth/allowed_signers.tmp /auth/allowed_signers
+EOS
+}
+
+extract_auth_volume() {
+    local username="$1"
+    local keys_out="$2"
+    local sig_out="$3"
+    docker volume inspect "openrig-auth-${username}" >/dev/null 2>&1 || return 1
+    local helper_img
+    helper_img=$(get_volume_helper_image)
+    local out
+    out=$(docker run --rm --entrypoint /bin/sh -u root -v "openrig-auth-${username}:/auth:ro" "$helper_img" -c '
+        if [ -s /auth/authorized_keys ]; then
+            echo "K:$(base64 < /auth/authorized_keys | tr -d "\r\n")"
+        fi
+        if [ -s /auth/authorized_keys.sig ]; then
+            echo "S:$(base64 < /auth/authorized_keys.sig | tr -d "\r\n")"
+        fi
+    ' 2>/dev/null) || return 1
+    local k_b64 s_b64
+    k_b64=$(printf '%s\n' "$out" | sed -n 's/^K://p' | head -n 1)
+    s_b64=$(printf '%s\n' "$out" | sed -n 's/^S://p' | head -n 1)
+    : > "$keys_out"
+    : > "$sig_out"
+    [ -n "$k_b64" ] && printf '%s' "$k_b64" | base64 -d > "$keys_out" 2>/dev/null || true
+    [ -n "$s_b64" ] && printf '%s' "$s_b64" | base64 -d > "$sig_out" 2>/dev/null || true
+    [ -s "$keys_out" ]
+}
+
+install_signed_auth_hook() {
+    local username="$1"
+    local cname="openrig-user-${username}"
+    docker exec -i -u root "$cname" bash -s << EOH
+set -e
+cat << 'EOV' > /usr/local/bin/rig-verify-keys
+#!/usr/bin/env bash
+set -euo pipefail
+TARGET_OS_USER="\${1:-}"
+[ "\$TARGET_OS_USER" = "rig" ] || exit 1
+TENANT_USER="${username}"
+KEYS="/etc/openrig-auth/authorized_keys"
+SIG="/etc/openrig-auth/authorized_keys.sig"
+SIGNERS="/etc/openrig-auth/allowed_signers"
+
+if [ ! -s "\$KEYS" ]; then
+    exit 0
+fi
+
+if [ ! -s "\$SIG" ] || [ ! -s "\$SIGNERS" ]; then
+    echo "[\$(date -u +"%Y-%m-%dT%H:%M:%SZ")] CRITICAL SECURITY ALERT: Missing Ed25519 signature for authorized_keys (fail-closed)" >> /workspace/.openrig-audit.log 2>/dev/null || true
+    echo "🚨 [OpenRig Zero-Trust] Missing authorized_keys signature for '\${TENANT_USER}'. Access blocked (fail-closed)." >&2
+    exit 1
+fi
+
+if ! ssh-keygen -Y verify -f "\$SIGNERS" -I "openrig-authority" -n "openrig-authorized-keys:\${TENANT_USER}" -s "\$SIG" < "\$KEYS" >/dev/null 2>&1; then
+    echo "[\$(date -u +"%Y-%m-%dT%H:%M:%SZ")] CRITICAL SECURITY ALERT: Ed25519 signature verification FAILED for authorized_keys (tampering detected, fail-closed)" >> /workspace/.openrig-audit.log 2>/dev/null || true
+    echo "🚨 [OpenRig Zero-Trust] CRITICAL: authorized_keys signature invalid for '\${TENANT_USER}'. Possible key injection blocked (fail-closed)." >&2
+    exit 1
+fi
+
+cat "\$KEYS"
+EOV
+chown root:root /usr/local/bin/rig-verify-keys
+chmod 755 /usr/local/bin/rig-verify-keys
+
+mkdir -p /etc/ssh/sshd_config.d
+cat << 'EOSC' > /etc/ssh/sshd_config.d/00-openrig-signed-auth.conf
+AuthorizedKeysFile none
+AuthorizedKeysCommand /usr/local/bin/rig-verify-keys %u
+AuthorizedKeysCommandUser root
+PasswordAuthentication no
+AcceptEnv OPENRIG_HW_ID OPENRIG_DEVICE_NAME
+EOSC
+chown root:root /etc/ssh/sshd_config.d/00-openrig-signed-auth.conf
+chmod 644 /etc/ssh/sshd_config.d/00-openrig-signed-auth.conf
+
+if [ -f /etc/openrig/authorized_keys ]; then
+    : > /etc/openrig/authorized_keys
+    chown root:root /etc/openrig/authorized_keys
+    chmod 644 /etc/openrig/authorized_keys
+fi
+rm -f /home/rig/.openrig-profiles/authorized_keys
+pkill -HUP -x sshd 2>/dev/null || true
+EOH
+}
+
+backup_user_keys() {
+    local username="$1"
+    ensure_server_authority
+    local host_keys="${KEYS_DIR}/${username}.keys"
+    local host_sig="${KEYS_DIR}/${username}.keys.sig"
+    local tmp_k="${host_keys}.tmp.$$"
+    local tmp_s="${host_sig}.tmp.$$"
+    if extract_auth_volume "$username" "$tmp_k" "$tmp_s"; then
+        if verify_keys_signature "$username" "$tmp_k" "$tmp_s"; then
+            mv "$tmp_k" "$host_keys"
+            mv "$tmp_s" "$host_sig"
+            chmod 600 "$host_keys" 2>/dev/null || true
+            chmod 644 "$host_sig" 2>/dev/null || true
+            return 0
+        else
+            log_audit_event "SECURITY_KEY_TAMPER_DETECTED" "VOLUME" "$username" "Refused to back up tampered keys from openrig-auth-${username}" >/dev/null || true
+            echo -e "${RED}🚨 SECURITY ALERT: Volume 'openrig-auth-${username}' failed Ed25519 signature check! Refusing backup (fail-closed).${RESET}" >&2
+        fi
+    fi
+    rm -f "$tmp_k" "$tmp_s"
+}
+
+sync_user_keys() {
+    local username="$1"
+    ensure_server_authority
+    local host_keys="${KEYS_DIR}/${username}.keys"
+    local host_sig="${KEYS_DIR}/${username}.keys.sig"
+    local tmp_k="${host_keys}.vol.$$"
+    local tmp_s="${host_sig}.vol.$$"
+
+    # 1. If existing signed volume is valid, refresh canonical host backup and normalize allowed_signers
+    if extract_auth_volume "$username" "$tmp_k" "$tmp_s"; then
+        if verify_keys_signature "$username" "$tmp_k" "$tmp_s"; then
+            mv "$tmp_k" "$host_keys"
+            mv "$tmp_s" "$host_sig"
+            chmod 600 "$host_keys" 2>/dev/null || true
+            chmod 644 "$host_sig" 2>/dev/null || true
+            publish_auth_volume "$username" "$host_keys" "$host_sig"
+            return 0
+        else
+            rm -f "$tmp_k" "$tmp_s"
+            log_audit_event "SECURITY_KEY_TAMPER_DETECTED" "VOLUME" "$username" "Tampered or unsigned keys detected in volume openrig-auth-${username}" >/dev/null || true
+            echo -e "${RED}🚨 SECURITY ALERT: Tampered/unsigned keys detected in volume 'openrig-auth-${username}'. Checking signed host backup...${RESET}" >&2
+        fi
+    fi
+    rm -f "$tmp_k" "$tmp_s"
+
+    # 2. Volume empty or tampered: restore ONLY from cryptographically verified host manifest (fail-closed)
+    if [ -s "$host_keys" ]; then
+        if [ -s "$host_sig" ] && verify_keys_signature "$username" "$host_keys" "$host_sig"; then
+            publish_auth_volume "$username" "$host_keys" "$host_sig"
+            return 0
+        else
+            log_audit_event "SECURITY_KEY_TAMPER_DETECTED" "HOST_FILE" "$username" "Unsigned or tampered host key file refused (fail-closed)" >/dev/null || true
+            echo -e "${RED}🚨 SECURITY ALERT: Unsigned or tampered key file '${host_keys}'. Refusing to load keys (fail-closed).${RESET}" >&2
+            echo -e "${YELLOW}   Inspect '${host_keys}' and run: rig-server keys sign ${username}${RESET}" >&2
+            publish_auth_volume "$username" "" ""
+            return 1
+        fi
+    fi
+
+    # 3. Brand new tenant (no keys yet): initialize allowed_signers cleanly in read-only volume
+    publish_auth_volume "$username" "" ""
+}
+
 cmd_user_create() {
     local username="${1:?Usage: rig-server user create <username> [--role fullstack] [--ram 4g] [--cpus 2] [--port 2201] [--ssh-key '<pubkey>']}"
     shift || true
@@ -343,6 +608,8 @@ cmd_user_create() {
     mkdir -p "$user_ws"
 
     echo -e "${CYAN}🚀 Provisioning isolated workstation for '${username}' (Role: ${role}, RAM: ${ram}, CPUs: ${cpus}, SSH Port: ${port})...${RESET}"
+
+    ensure_server_authority
 
     docker network inspect "$net_name" >/dev/null 2>&1 || docker network create "$net_name" >/dev/null
 
@@ -402,12 +669,22 @@ cmd_user_create() {
         -e OPENRIG_ENABLE_SHARE="${enable_share}" \
         -e OPENRIG_ALLOW_ADMIN_ATTACH="${allow_admin_attach}" \
         -e COMPOSE_PROJECT_NAME="openrig-${username}" \
-        -e AUTHORIZED_SSH_KEY="$ssh_key" \
+        -e AUTHORIZED_SSH_KEY="" \
         -p "${port}:22" \
         -v "${user_ws}:/workspace" \
         -v "openrig-home-${username}:/home/rig/.openrig-profiles" \
+        -v "openrig-auth-${username}:/etc/openrig-auth:ro" \
         "openrig:${role}" >/dev/null
 
+    if [ -n "$ssh_key" ] && [ ! -s "${KEYS_DIR}/${username}.keys" ]; then
+        printf '%s\n' "$ssh_key" > "${KEYS_DIR}/${username}.keys"
+        chmod 600 "${KEYS_DIR}/${username}.keys" 2>/dev/null || true
+        sign_keys_file "$username" "${KEYS_DIR}/${username}.keys" "${KEYS_DIR}/${username}.keys.sig"
+        publish_auth_volume "$username" "${KEYS_DIR}/${username}.keys" "${KEYS_DIR}/${username}.keys.sig"
+    else
+        sync_user_keys "$username" || true
+    fi
+    install_signed_auth_hook "$username"
     provision_worker_ai_ticket "$username" || true
 
     # Record in users.db
@@ -502,12 +779,16 @@ cmd_user_action() {
             log_audit_event "ADMIN_WORKSTATION_CONTROL" "START" "$username" "Workstation container started by admin"
             local upstream_sock
             upstream_sock=$(get_upstream_docker_sock)
-            if [ -n "$upstream_sock" ]; then
+            if [ -n "$upstream_sock" ] && [ "${OPENRIG_SCOPED_DOCKER_PROXY:-false}" = "true" ]; then
                 local sdir
                 sdir=$(get_sockets_dir)
                 ensure_docker_proxy "$username" "${sdir}/${username}.sock"
             fi
-            docker start "$cname" >/dev/null
+            if ! docker start "$cname" 2>/dev/null; then
+                echo -e "${YELLOW}⚠️  Container '${cname}' could not start directly (stale host mounts after Docker/WSL reboot). Auto-recreating...${RESET}"
+                cmd_user_action recreate "$username"
+                return 0
+            fi
             echo -e "${GREEN}▶️  Workstation for '${username}' started.${RESET}"
             ;;
         recreate|reload)
@@ -521,20 +802,10 @@ cmd_user_action() {
                 ram=$(echo "$entry" | cut -d: -f4)
                 cpus=$(echo "$entry" | cut -d: -f5)
             fi
-            local saved_keys_file="${SERVER_DIR}/config/keys/${username}.keys"
-            mkdir -p "${SERVER_DIR}/config/keys"
-            if docker inspect "$cname" >/dev/null 2>&1; then
-                docker exec -u root "$cname" cat /etc/openrig/authorized_keys > "$saved_keys_file" 2>/dev/null || true
-            fi
+            backup_user_keys "$username"
             echo -e "${CYAN}🔄 Recreating workstation for '${username}' with native Docker socket...${RESET}"
             docker rm -f "$cname" >/dev/null 2>&1 || true
             cmd_user_create "$username" --role "$role" --ram "$ram" --cpus "$cpus" --port "$port"
-            if [ -s "$saved_keys_file" ]; then
-                docker exec -u root "$cname" mkdir -p /etc/openrig
-                docker cp "$saved_keys_file" "${cname}:/etc/openrig/authorized_keys"
-                docker exec -u root "$cname" chown root:root /etc/openrig/authorized_keys
-                docker exec -u root "$cname" chmod 644 /etc/openrig/authorized_keys
-            fi
             echo -e "${GREEN}✔ Workstation '${cname}' successfully recreated with Docker socket active.${RESET}"
             ;;
         sessions|history|log)
@@ -1264,6 +1535,233 @@ print("")
 PY
 }
 
+check_tenant_keys_integrity() {
+    local username="$1"
+    ensure_server_authority
+    local host_keys="${KEYS_DIR}/${username}.keys"
+    local host_sig="${KEYS_DIR}/${username}.keys.sig"
+    local host_state="EMPTY"
+    local vol_state="EMPTY"
+    local ok=0
+
+    if [ -s "$host_keys" ]; then
+        if [ ! -s "$host_sig" ]; then
+            host_state="UNSIGNED"
+            ok=1
+        elif verify_keys_signature "$username" "$host_keys" "$host_sig"; then
+            host_state="VALID"
+        else
+            host_state="TAMPERED"
+            ok=1
+        fi
+    fi
+
+    if ! docker volume inspect "openrig-auth-${username}" >/dev/null 2>&1; then
+        vol_state="NO_VOLUME"
+        [ "$host_state" != "EMPTY" ] && ok=1
+    else
+        local tmp_vk="/tmp/openrig-chk-k.$$"
+        local tmp_vs="/tmp/openrig-chk-s.$$"
+        if extract_auth_volume "$username" "$tmp_vk" "$tmp_vs"; then
+            if verify_keys_signature "$username" "$tmp_vk" "$tmp_vs"; then
+                if [ "$host_state" = "VALID" ] && cmp -s "$host_keys" "$tmp_vk"; then
+                    vol_state="VALID (SYNCED)"
+                else
+                    vol_state="VALID (DRIFT)"
+                    ok=1
+                fi
+            else
+                vol_state="TAMPERED"
+                ok=1
+            fi
+        else
+            vol_state="EMPTY"
+            [ "$host_state" != "EMPTY" ] && ok=1
+        fi
+        rm -f "$tmp_vk" "$tmp_vs"
+    fi
+
+    printf "  %-16s %-12s %-18s\n" "$username" "$host_state" "$vol_state"
+    return "$ok"
+}
+
+cmd_authority() {
+    local sub="${1:-status}"
+    shift || true
+    case "$sub" in
+        status|show|info)
+            ensure_server_authority
+            banner
+            echo -e "${BOLD}🔐 OpenRig-Server Ed25519 Key-Signing Authority:${RESET}\n"
+            echo -e "  • Authority Key:    ${AUTHORITY_PUB}"
+            echo -e "  • Fingerprint:      $(ssh-keygen -lf "$AUTHORITY_PUB" 2>/dev/null || echo 'unknown')"
+            echo -e "  • Allowed Signers:  ${ALLOWED_SIGNERS}"
+            echo ""
+            echo -e "${BOLD}Tenant Key Signature Integrity:${RESET}"
+            printf "  %-16s %-12s %-18s\n" "USERNAME" "HOST FILE" "AUTH VOLUME (:ro)"
+            echo "  --------------------------------------------------"
+            local any_fail=0
+            local seen=""
+            while IFS=: read -r u _rest; do
+                [ -z "$u" ] && continue
+                seen="${seen} ${u} "
+                check_tenant_keys_integrity "$u" || any_fail=1
+            done < "$USERS_DB"
+            for kf in "${KEYS_DIR}"/*.keys; do
+                [ -f "$kf" ] || continue
+                local u
+                u=$(basename "$kf" .keys)
+                [[ "$seen" == *" ${u} "* ]] && continue
+                check_tenant_keys_integrity "$u" || any_fail=1
+            done
+            echo ""
+            return "$any_fail"
+            ;;
+        *)
+            echo "Usage: rig-server authority [status]"
+            ;;
+    esac
+}
+
+cmd_keys() {
+    local sub="${1:-list}"
+    shift || true
+    ensure_server_authority
+    case "$sub" in
+        list|ls)
+            local username="${1:?Usage: rig-server keys list <username>}"
+            local host_keys="${KEYS_DIR}/${username}.keys"
+            local host_sig="${KEYS_DIR}/${username}.keys.sig"
+            local sig_status="EMPTY"
+            if [ -s "$host_keys" ]; then
+                if [ ! -s "$host_sig" ]; then
+                    sig_status="UNSIGNED"
+                elif verify_keys_signature "$username" "$host_keys" "$host_sig"; then
+                    sig_status="VALID"
+                else
+                    sig_status="TAMPERED"
+                fi
+            fi
+            echo -e "${BOLD}🔑 Bound SSH Keys for '${username}' [Signature: ${sig_status}]:${RESET}"
+            if [ ! -s "$host_keys" ]; then
+                echo "  (No keys registered yet)"
+                return 0
+            fi
+            python3 - "$host_keys" << 'PY'
+import re, sys
+for idx, line in enumerate(open(sys.argv[1], encoding="utf-8", errors="ignore").read().splitlines(), 1):
+    line = line.strip()
+    if not line:
+        continue
+    m = re.search(r'rig-session-guard\s+([^\s]+)\s+([^"]+)"', line)
+    if m:
+        hw, dev = m.group(1), m.group(2)
+        print(f"  {idx}. Device: {dev:<24} | Hardware ID: {hw[:16]}...")
+    else:
+        print(f"  {idx}. Direct Key: {line[:64]}...")
+PY
+            ;;
+        verify|check)
+            local target="${1:---all}"
+            echo -e "${BOLD}🔎 Verifying Ed25519 Signatures (Host + Auth Volume):${RESET}"
+            printf "  %-16s %-12s %-18s\n" "USERNAME" "HOST FILE" "AUTH VOLUME (:ro)"
+            echo "  --------------------------------------------------"
+            local rc=0
+            if [ "$target" = "--all" ] || [ "$target" = "all" ]; then
+                local seen=""
+                while IFS=: read -r u _rest; do
+                    [ -z "$u" ] && continue
+                    seen="${seen} ${u} "
+                    check_tenant_keys_integrity "$u" || rc=1
+                done < "$USERS_DB"
+                for kf in "${KEYS_DIR}"/*.keys; do
+                    [ -f "$kf" ] || continue
+                    local u
+                    u=$(basename "$kf" .keys)
+                    [[ "$seen" == *" ${u} "* ]] && continue
+                    check_tenant_keys_integrity "$u" || rc=1
+                done
+            else
+                check_tenant_keys_integrity "$target" || rc=1
+            fi
+            if [ "$rc" -eq 0 ]; then
+                echo -e "\n${GREEN}✅ All verified key manifests passed Ed25519 integrity checks.${RESET}"
+            else
+                echo -e "\n${RED}🚨 Integrity check FAILED for one or more tenants!${RESET}" >&2
+            fi
+            return "$rc"
+            ;;
+        sign|approve)
+            local username="${1:?Usage: rig-server keys sign <username>}"
+            local host_keys="${KEYS_DIR}/${username}.keys"
+            local host_sig="${KEYS_DIR}/${username}.keys.sig"
+            if [ ! -s "$host_keys" ]; then
+                echo -e "${RED}❌ No non-empty key file found at '${host_keys}'.${RESET}"
+                return 1
+            fi
+            local aid
+            aid=$(log_audit_event "ADMIN_KEYS_SIGN" "ED25519_SIGN" "$username" "Admin signed authorized_keys and published to :ro volume")
+            sign_keys_file "$username" "$host_keys" "$host_sig"
+            chmod 600 "$host_keys" 2>/dev/null || true
+            publish_auth_volume "$username" "$host_keys" "$host_sig"
+            echo -e "${GREEN}✅ Signed '${host_keys}' with Server Authority and published to 'openrig-auth-${username}' (:ro) [Audit: ${aid}].${RESET}"
+            ;;
+        revoke|remove)
+            local username="${1:?Usage: rig-server keys revoke <username> <device>}"
+            local device="${2:?Usage: rig-server keys revoke <username> <device>}"
+            local host_keys="${KEYS_DIR}/${username}.keys"
+            local host_sig="${KEYS_DIR}/${username}.keys.sig"
+            if [ ! -s "$host_keys" ]; then
+                echo -e "${RED}❌ No keys registered for '${username}'.${RESET}"
+                return 1
+            fi
+            if ! verify_keys_signature "$username" "$host_keys" "$host_sig"; then
+                echo -e "${RED}🚨 SECURITY HOLD: Cannot modify tampered/unsigned '${host_keys}'. Inspect and resolve first.${RESET}" >&2
+                return 1
+            fi
+            local tmp_new="${host_keys}.rev.$$"
+            local removed
+            removed=$(python3 - "$host_keys" "$tmp_new" "$device" << 'PY'
+import re, sys
+src, dst, dev = sys.argv[1], sys.argv[2], sys.argv[3]
+kept = []
+removed = 0
+for line in open(src, encoding="utf-8").read().splitlines():
+    if not line.strip():
+        continue
+    m = re.search(r'rig-session-guard\s+[^\s]+\s+([^"]+)"', line)
+    if m and m.group(1) == dev:
+        removed += 1
+    else:
+        kept.append(line)
+open(dst, "w", encoding="utf-8", newline="\n").write(("\n".join(kept) + "\n") if kept else "")
+print(removed)
+PY
+)
+            if [ "$removed" = "0" ]; then
+                rm -f "$tmp_new"
+                echo -e "${YELLOW}⚠️  No bound key matched device '${device}' for '${username}'.${RESET}"
+                return 1
+            fi
+            mv "$tmp_new" "$host_keys"
+            chmod 600 "$host_keys" 2>/dev/null || true
+            if [ -s "$host_keys" ]; then
+                sign_keys_file "$username" "$host_keys" "$host_sig"
+                publish_auth_volume "$username" "$host_keys" "$host_sig"
+            else
+                rm -f "$host_sig"
+                publish_auth_volume "$username" "" ""
+            fi
+            local aid
+            aid=$(log_audit_event "ADMIN_KEYS_REVOKE" "ED25519_REVOKE" "$username" "Revoked device '${device}' (${removed} key(s))")
+            echo -e "${GREEN}🗑️  Revoked ${removed} key(s) for device '${device}' and republished signed manifest immediately [Audit: ${aid}].${RESET}"
+            ;;
+        *)
+            echo "Usage: rig-server keys [list <user> | verify [user|--all] | sign <user> | revoke <user> <device>]"
+            ;;
+    esac
+}
+
 ACTION="${1:-help}"
 shift || true
 
@@ -1284,6 +1782,8 @@ case "$ACTION" in
     restart)              cmd_user_action "stop" "$@" && cmd_user_action "start" "$@" ;;
     stop)                 cmd_user_action "stop" "$@" ;;
     start)                cmd_user_action "start" "$@" ;;
+    authority|ca)         cmd_authority "$@" ;;
+    keys|key)             cmd_keys "$@" ;;
     audit|logs)           cmd_audit "$@" ;;
     status|list|ps)       cmd_user_list ;;
     create|new)           cmd_create_wizard "$@" ;;
@@ -1307,6 +1807,8 @@ case "$ACTION" in
         echo "  rig-server ai [set|status|pause|resume] -> Manage Shared Zero-Key Corporate AI Broker (Bedrock/Anthropic/Gemini/OpenAI)"
         echo "  rig-server dlp <user> --mode [sanitized|approval|airgapped] [--block-terms 'corp,secret']"
         echo "  rig-server brain-requests        -> Review, approve, or reject user 'rig brain learn' exports"
+        echo "  rig-server authority status      -> Show Ed25519 key-signing authority & tenant integrity"
+        echo "  rig-server keys [list|verify|sign|revoke] -> Manage & verify cryptographically signed SSH keys"
         echo "  rig-server invite create --user <user> [--role fullstack] [--ram 4g] [--cpus 2]"
         echo "  rig-server invite list           -> List invitations and bound Hardware IDs per user"
         echo "  rig-server status                -> Dashboard of users, ports, quotas, and live consumption"
